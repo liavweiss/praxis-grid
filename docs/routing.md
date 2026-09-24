@@ -1157,7 +1157,62 @@ flowchart LR
 - request-specific prefix/cache-aware scheduling;
 - inference-engine internals.
 
-The result is that sophisticated routing policy can change asynchronously without introducing a distributed control-plane lookup into every inference request.
+The result is that sophisticated routing policy can change asynchronously
+without introducing a distributed control-plane lookup into every inference
+request.
+
+---
+
+# 15. Agent tool discovery overlays
+
+AGN discovers MCP tools from `AgentToolProvider` resources and publishes them
+as routing-overlay candidates. This is a control-plane discovery capability,
+not a complete MCP request-routing pipeline.
+
+## Discovery and propagation
+
+1. An `AgentToolProvider` references a `GridNetwork` and an MCP endpoint.
+2. The operator probes the endpoint and records advertised tool names in
+   `status.discoveredTools`.
+3. Each admitted tool produces an overlay candidate with
+   `kind: "mcp_tool"`.
+4. Tool provider state propagates to remote sites through SWIM and CRDT state.
+
+Tool providers use a `tool/` prefix in their CRDT provider identity. This keeps
+an `AgentToolProvider` distinct from an `InferenceProvider` with the same
+Kubernetes name. Tool names travel in the SWIM broadcast extension rather than
+the capability OR-set.
+
+Tool candidates do not receive inference metrics, queue-depth scores, or
+capacity weighting. Unavailable providers are excluded from overlays.
+
+## Tool allowlist
+
+When both `spec.tools` and `status.discoveredTools` are non-empty,
+`spec.tools` acts as an allowlist. Only discovered names present in
+`spec.tools` enter the overlay. An empty `spec.tools` exposes all discovered
+tools.
+
+## Access policy
+
+Tool providers use the same `accessPolicy.siteSelector.matchLabels` mechanism
+as inference providers. If the consumer site identity is unknown and
+`matchLabels` is non-empty, evaluation fails closed and excludes the provider.
+
+## Data-plane boundary
+
+The operator-generated consumer Praxis config is model-oriented: it parses a
+model field and configures inference clusters. It therefore projects only
+`inference_model` candidates. A tool-only overlay cannot produce that consumer
+config. If no inference candidates remain, the operator removes a previously
+generated static consumer config; an already-running static consumer still
+requires its documented restart or reload to discard in-memory routes.
+
+Executing MCP tool calls requires a dedicated MCP-capable Praxis pipeline that
+extracts MCP tool metadata and defines a reachable load-balancer cluster for
+every selected tool candidate. The routing overlay can supply discovery input
+to that pipeline, but AGN does not derive or install the MCP data-plane
+configuration in this change.
 
 ---
 

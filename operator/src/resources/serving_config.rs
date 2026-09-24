@@ -124,19 +124,19 @@ pub(crate) struct ServingInputs<'input> {
     pub(crate) pins: &'input BTreeMap<String, Vec<String>>,
 }
 
-/// Render from `(site, signals endpoint)` members, `None` when no candidate survives.
+/// Render from `(site, signals endpoint)` members.
+///
+/// An empty candidate list is an authoritative no-route state. It must still
+/// be written so a gateway cannot retain candidates from an older config.
 pub(crate) fn render<'member, Members>(
     overlay: &RoutingOverlay,
     members: Members,
     inputs: &ServingInputs<'_>,
-) -> Option<ServingConfig>
+) -> ServingConfig
 where
     Members: IntoIterator<Item = (&'member str, &'member str)>,
 {
     let candidates = candidates(&overlay.candidates, &overlay.local_site);
-    if candidates.is_empty() {
-        return None;
-    }
     let sites: BTreeSet<&str> = candidates.iter().map(|candidate| candidate.site.as_str()).collect();
     let mut addrs = remote_addrs(members, &sites, &overlay.local_site);
     if let Some(addr) = inputs.local_signals_addr
@@ -152,13 +152,13 @@ where
             peer(site, addr, inputs.tls_mount, pins)
         })
         .collect();
-    Some(ServingConfig {
+    ServingConfig {
         local_site: overlay.local_site.clone(),
         window_secs: WINDOW_SECS,
         load_window_ms: LOAD_WINDOW_MS,
         candidates,
         peers,
-    })
+    }
 }
 
 /// Alive members worth dialing at their signals endpoint, with pins, none over unencrypted gossip.
@@ -426,8 +426,16 @@ mod tests {
     #[test]
     fn renders_the_contract_the_gateway_parses() {
         let members = [("site-b", "203.0.113.7:9091"), ("site-a", "198.51.100.1:9091")];
-        let config = render(&two_site(), members, &INPUTS).expect("routable");
+        let config = render(&two_site(), members, &INPUTS);
         assert_eq!(to_text(&config).expect("json"), GOLDEN.trim_end(), "golden drifted");
+    }
+
+    #[test]
+    fn empty_overlay_renders_authoritative_no_route_config() {
+        let config = render(&overlay(Vec::new()), [("site-b", "203.0.113.7:9091")], &INPUTS);
+        assert!(config.candidates.is_empty());
+        assert!(config.peers.is_empty());
+        assert!(to_text(&config).expect("json").contains("\"candidates\": []"));
     }
 
     #[test]
@@ -438,8 +446,8 @@ mod tests {
         shuffled.candidates.push(cand("llama", "site-c", "pool-c", None));
         let mut ordered = two_site();
         ordered.candidates.insert(0, cand("llama", "site-c", "pool-c", None));
-        let first = to_text(&render(&shuffled, forward, &INPUTS).expect("routable")).expect("json");
-        let second = to_text(&render(&ordered, reverse, &INPUTS).expect("routable")).expect("json");
+        let first = to_text(&render(&shuffled, forward, &INPUTS)).expect("json");
+        let second = to_text(&render(&ordered, reverse, &INPUTS)).expect("json");
         assert_eq!(first, second, "same inputs in any order render the same bytes");
     }
 
@@ -447,7 +455,7 @@ mod tests {
     fn local_candidates_lead_and_duplicates_collapse() {
         let mut dup = two_site();
         dup.candidates.push(cand("llama", "site-b", "pool-b", None));
-        let config = render(&dup, [], &INPUTS).expect("routable");
+        let config = render(&dup, [], &INPUTS);
         let order: Vec<&str> = config.candidates.iter().map(|c| c.site.as_str()).collect();
         assert_eq!(order, ["site-a", "site-b"], "local first, one entry per tuple");
     }
@@ -467,11 +475,17 @@ mod tests {
             ),
         ];
         for (label, bad) in cases {
-            assert!(render(&overlay(vec![bad]), [], &INPUTS).is_none(), "{label}");
+            assert!(
+                render(&overlay(vec![bad]), [], &INPUTS).candidates.is_empty(),
+                "{label}"
+            );
         }
         let mut mcp = cand("tool", "site-b", "pool-b", None);
         mcp.kind = "mcp_tool".to_owned();
-        assert!(render(&overlay(vec![mcp]), [], &INPUTS).is_none(), "mcp_tool");
+        assert!(
+            render(&overlay(vec![mcp]), [], &INPUTS).candidates.is_empty(),
+            "mcp_tool"
+        );
     }
 
     #[test]
@@ -494,13 +508,13 @@ mod tests {
             ("path and query", "evil.example/x?:9091"),
         ];
         for (label, endpoint) in cases {
-            let config = render(&two_site(), [("site-b", endpoint)], &INPUTS).expect("routable");
+            let config = render(&two_site(), [("site-b", endpoint)], &INPUTS);
             assert!(config.peers.is_empty(), "{label}: {endpoint} must be refused");
         }
-        let other = render(&two_site(), [("site-z", "203.0.113.9:9091")], &INPUTS).expect("routable");
+        let other = render(&two_site(), [("site-z", "203.0.113.9:9091")], &INPUTS);
         assert!(other.peers.is_empty(), "a site with no candidate is not polled");
         let bad_name = overlay(vec![cand("llama", "Site_B", "pool-b", None)]);
-        let config = render(&bad_name, [("Site_B", "203.0.113.7:9091")], &INPUTS).expect("routable");
+        let config = render(&bad_name, [("Site_B", "203.0.113.7:9091")], &INPUTS);
         assert!(
             config.peers.is_empty(),
             "a non-DNS site name would fail the gateway's SNI"
@@ -520,7 +534,7 @@ mod tests {
         for site in ["site-c", "site-d", "site-e", "site-f"] {
             topo.candidates.push(cand("llama", site, "pool", None));
         }
-        let config = render(&topo, members, &INPUTS).expect("routable");
+        let config = render(&topo, members, &INPUTS);
         assert_eq!(
             peer_sites(&config),
             [
@@ -542,7 +556,7 @@ mod tests {
             ("stale first", [stale.clone(), fresh.clone()]),
             ("stale last", [fresh, stale]),
         ] {
-            let config = render(&overlay(pair.to_vec()), [], &INPUTS).expect("routable");
+            let config = render(&overlay(pair.to_vec()), [], &INPUTS);
             assert_eq!(config.candidates.len(), 1, "{label}: one entry");
             assert!(!config.candidates[0].fresh, "{label}: stale");
         }
@@ -647,11 +661,11 @@ mod tests {
     fn pin_trust_carries_the_declared_pins_to_the_gateway() {
         let pins = BTreeMap::from([("site-b".to_owned(), vec!["ab".repeat(32)])]);
         let inputs = ServingInputs { pins: &pins, ..INPUTS };
-        let config = render(&two_site(), [("site-b", "203.0.113.7:9091")], &inputs).expect("routable");
+        let config = render(&two_site(), [("site-b", "203.0.113.7:9091")], &inputs);
         let peer = config.peers.first().expect("peer");
         assert_eq!(peer.pins, ["ab".repeat(32)]);
         assert!(to_text(&config).expect("json").contains("\"pins\""), "rendered");
-        let spiffe = to_text(&render(&two_site(), [("site-b", "203.0.113.7:9091")], &INPUTS).expect("routable"));
+        let spiffe = to_text(&render(&two_site(), [("site-b", "203.0.113.7:9091")], &INPUTS));
         assert!(!spiffe.expect("json").contains("pins"), "absent without pins");
     }
 
@@ -662,9 +676,9 @@ mod tests {
             ..INPUTS
         };
         let gossip = [("site-a", "203.0.113.1:9091")];
-        let config = render(&two_site(), gossip, &inputs).expect("routable");
+        let config = render(&two_site(), gossip, &inputs);
         assert_eq!(peer_sites(&config), [("site-a", "grid-operator-signals.grid.svc:9091")]);
-        let without = render(&two_site(), gossip, &INPUTS).expect("routable");
+        let without = render(&two_site(), gossip, &INPUTS);
         assert!(without.peers.is_empty(), "gossip never names the local peer");
     }
 

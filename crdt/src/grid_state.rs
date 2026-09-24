@@ -17,7 +17,7 @@
 //! change assumes all Grid operators in a Kind/test mesh run the same build.
 //! Mixed-version SWIM/CRDT compatibility is not currently defined or tested.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -143,6 +143,16 @@ pub struct ProviderState {
 
     /// Models served by this provider.
     pub models: Vec<String>,
+
+    /// MCP tools served by this provider.
+    ///
+    /// Non-empty for tool providers reconciled from `AgentToolProvider` CRDs.
+    /// Empty for inference providers.
+    ///
+    /// The SWIM wire envelope transports this value in its versioned trailing
+    /// extension so the positional bincode base snapshot remains compatible.
+    #[serde(skip, default)]
+    pub tools: Vec<String>,
 
     /// Backend locality kind (`local`, `remote`, `cloud_managed`, `api_provider`).
     pub backend_kind: String,
@@ -372,6 +382,34 @@ impl GridStateSnapshot {
         }
     }
 
+    /// Replace provider records for one origin within the supplied networks.
+    ///
+    /// Provider records owned by the origin in other networks are retained.
+    /// Returns the network IDs represented by accepted authoritative records.
+    pub fn replace_origin_providers_in_networks(
+        &mut self,
+        origin_site: &str,
+        revision: u64,
+        network_ids: &BTreeSet<String>,
+        authoritative: &Self,
+    ) -> BTreeSet<String> {
+        self.providers
+            .retain(|_, provider| provider.site_id != origin_site || !network_ids.contains(&provider.network_id));
+        let mut accepted_network_ids = BTreeSet::new();
+        for provider in authoritative
+            .providers
+            .values()
+            .filter(|provider| provider.site_id == origin_site && network_ids.contains(&provider.network_id))
+        {
+            let mut provider = provider.clone();
+            accepted_network_ids.insert(provider.network_id.clone());
+            provider.revision = revision;
+            origin_site.clone_into(&mut provider.writer_id);
+            self.upsert_provider(provider);
+        }
+        accepted_network_ids
+    }
+
     /// Remove all provider records originating from `origin_site`.
     ///
     /// Used by the SWIM runtime's dead-member eviction sweep to clean up
@@ -416,6 +454,7 @@ mod tests {
             provider_id: provider_id.to_owned(),
             routing_cluster: site.to_owned(),
             models: vec!["model-x".to_owned()],
+            tools: Vec::new(),
             backend_kind: "local".to_owned(),
             capacity_weight: 1,
             phase: ProviderPhase::Available,
@@ -512,6 +551,35 @@ mod tests {
         assert!(
             current.provider("net", "site-q", "foreign").is_none(),
             "an origin cannot authoritatively replace another site's provider"
+        );
+    }
+
+    #[test]
+    fn scoped_origin_replacement_preserves_other_networks() {
+        let mut current = GridStateSnapshot::new("consumer".to_owned());
+        let mut network_a = provider("site-p", "provider-a", 9, 0.9);
+        network_a.network_id = "net-a".to_owned();
+        let mut network_b = provider("site-p", "provider-b", 9, 0.4);
+        network_b.network_id = "net-b".to_owned();
+        current.upsert_provider(network_a);
+        current.upsert_provider(network_b);
+
+        let authoritative = GridStateSnapshot::new("site-p".to_owned());
+        let accepted = current.replace_origin_providers_in_networks(
+            "site-p",
+            10,
+            &BTreeSet::from(["net-a".to_owned()]),
+            &authoritative,
+        );
+
+        assert!(accepted.is_empty(), "an empty scoped replacement accepts no networks");
+        assert!(
+            current.provider("net-a", "site-p", "provider-a").is_none(),
+            "the selected network must be withdrawn"
+        );
+        assert!(
+            current.provider("net-b", "site-p", "provider-b").is_some(),
+            "another network from the same origin must remain"
         );
     }
 
@@ -701,6 +769,88 @@ mod tests {
         assert_eq!(
             provider.capacity_weight, 1,
             "missing capacity_weight must retain equal-capacity behavior"
+        );
+    }
+
+    #[test]
+    fn tools_field_defaults_to_empty_when_absent() {
+        let json_without_tools = r#"{
+            "network_id": "net",
+            "site_id": "site-old",
+            "provider_id": "legacy-prov",
+            "routing_cluster": "site-old",
+            "models": ["model-a"],
+            "backend_kind": "local",
+            "phase": "Available",
+            "metrics": {},
+            "revision": 1,
+            "writer_id": "site-old"
+        }"#;
+        let provider: ProviderState =
+            serde_json::from_str(json_without_tools).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            provider.tools.is_empty(),
+            "missing tools field must deserialize to empty Vec (backward compat)"
+        );
+    }
+
+    /// `tools` is `#[serde(skip)]` so it is excluded from serialized output
+    /// and defaults to empty on deserialization. The SWIM extension layer
+    /// carries tool data separately.
+    #[test]
+    fn tools_field_is_skipped_in_json_serde() {
+        let state = ProviderState {
+            network_id: "net".to_owned(),
+            site_id: "site-a".to_owned(),
+            provider_id: "tool-prov".to_owned(),
+            routing_cluster: "site-a".to_owned(),
+            models: Vec::new(),
+            tools: vec!["search".to_owned(), "calculator".to_owned()],
+            backend_kind: String::new(),
+            capacity_weight: 1,
+            phase: ProviderPhase::Available,
+            metrics: ProviderMetricsSnapshot::default(),
+            access_policy: ProviderAccessPolicy::default(),
+            revision: 1,
+            writer_id: "site-a".to_owned(),
+        };
+        let json = serde_json::to_string(&state).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            !json.contains("tools"),
+            "tools must NOT appear in JSON output (serde skip)"
+        );
+        let restored: ProviderState = serde_json::from_str(&json).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            restored.tools.is_empty(),
+            "tools must default to empty after JSON round-trip (they travel in the extension)"
+        );
+    }
+
+    /// `tools` is `#[serde(skip)]` on `ProviderState` so it is NOT part of the
+    /// base bincode snapshot. A direct snapshot round-trip must produce empty
+    /// tools. The SWIM `StateBroadcast` layer carries tools via the trailing
+    /// `BroadcastExtension` and restores them on decode - that path is tested
+    /// in the `swim` crate.
+    #[test]
+    fn tools_field_is_skipped_in_base_bincode_snapshot() {
+        let mut snap = GridStateSnapshot::new("site-a".to_owned());
+        let mut state = provider("site-a", "tool-prov", 1, 0.0);
+        state.tools = vec!["web-search".to_owned(), "code-exec".to_owned()];
+        state.models = Vec::new();
+        snap.upsert_provider(state);
+
+        let bytes =
+            bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap_or_else(|_| std::process::abort());
+        let (restored, _len): (GridStateSnapshot, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                .unwrap_or_else(|_| std::process::abort());
+
+        let restored_provider = restored
+            .provider("net", "site-a", "tool-prov")
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            restored_provider.tools.is_empty(),
+            "tools must be empty after base bincode round-trip (they travel in the extension)"
         );
     }
 

@@ -205,6 +205,12 @@ configuration. The versioned routing overlay is a separate projected file that
 `intelligent_route` can validate and hot-reload in process. See
 [Reload and rollout](#reload-and-rollout) below.
 
+When no inference candidates remain, the operator removes its generated static
+consumer `ConfigMap` so a future start cannot load stale routes. That deletion
+does not revoke routes already loaded by a running static-only consumer; use a
+rollout or explicit reload for that path. The dynamic overlay and grid serving
+config publish an empty authoritative candidate set and fail closed in process.
+
 ## Edge-ingress deployments
 
 External edge-ingress gateways reuse the same consumer config contract: the

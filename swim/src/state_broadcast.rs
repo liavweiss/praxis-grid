@@ -35,6 +35,16 @@ pub const STATE_BROADCAST_VERSION: u16 = STATE_BROADCAST_VERSION_V1;
 /// Default hard bound for distinct origins retained by one broadcast handler.
 pub const DEFAULT_MAX_RETAINED_ORIGINS: usize = 1_024;
 
+/// Maximum provider-state scopes retained for each configured origin slot.
+const RETAINED_SCOPE_MULTIPLIER: usize = 16;
+
+/// Magic prefix for the framed provider-state extension appended after the
+/// legacy signals-address slot.
+const PROVIDER_STATE_EXTENSION_MAGIC: [u8; 8] = *b"AGNPSEXT";
+
+/// First framed provider-state extension version.
+const PROVIDER_STATE_EXTENSION_VERSION_V1: u8 = 1;
+
 /// Domain-separation prefix mixed into every state-broadcast signature.
 ///
 /// Binds a signature to this exact protocol, message type, and wire-format
@@ -49,6 +59,9 @@ pub const DEFAULT_MAX_RETAINED_ORIGINS: usize = 1_024;
 /// identity — remains out of scope for this constant and for `grid_id`
 /// alike.
 const SIGNATURE_DOMAIN: &[u8] = b"praxis-grid/swim/state-broadcast/v1";
+
+/// Bounded log message shared by signature verification failures.
+const REJECTED_BROADCAST_LOG: &str = "rejecting pinned-origin state broadcast";
 
 /// Maximum age, in milliseconds, of a pinned origin's signed broadcast
 /// timestamp before it is rejected as stale.
@@ -83,6 +96,14 @@ pub struct StateBroadcast {
 
     /// Mergeable grid-state snapshot.
     pub snapshot: GridStateSnapshot,
+
+    /// Whether this snapshot authoritatively replaces the origin's providers.
+    ///
+    /// This distinguishes an intentional empty provider inventory from a
+    /// metadata-only broadcast. Peers that predate this field safely ignore
+    /// its framed trailing extension.
+    #[serde(default)]
+    pub authoritative_provider_state: bool,
 
     /// Data-plane gateway address advertised by this site.
     ///
@@ -209,7 +230,10 @@ struct StateBroadcastV1 {
     snapshot: GridStateSnapshot,
 }
 
-/// Extension after the base v1 payload, then an optional signals address, trailing bytes older peers ignore.
+/// Legacy extension after the base v1 payload.
+///
+/// This six-field layout is immutable because deployed peers decode it
+/// positionally, followed by the optional signals-address slot.
 #[derive(Default, Serialize, Deserialize)]
 struct BroadcastExtension {
     /// Optional data-plane gateway address.
@@ -232,6 +256,26 @@ struct BroadcastExtension {
     /// Provider capacities keyed by stable network/site/provider identity.
     #[serde(default)]
     provider_capacity_weights: BTreeMap<String, u32>,
+}
+
+/// Header for a length-delimited provider-state extension frame.
+#[derive(Deserialize, Serialize)]
+struct ProviderStateExtensionHeader {
+    /// Fixed marker distinguishing the frame from other trailing data.
+    magic: [u8; 8],
+    /// Encoded payload length in bytes.
+    payload_length: u32,
+    /// Payload schema version.
+    version: u8,
+}
+
+/// Provider-state extension payload understood by current peers.
+#[derive(Default, Deserialize, Serialize)]
+struct ProviderStateExtensionV1 {
+    /// Whether an empty provider set is an authoritative withdrawal.
+    authoritative_provider_state: bool,
+    /// MCP tool lists keyed by stable network/site/provider identity.
+    provider_tools: BTreeMap<String, Vec<String>>,
 }
 
 /// Extension format used by peers that predate provider capacity weights.
@@ -306,6 +350,7 @@ impl StateBroadcast {
             origin_site,
             revision,
             snapshot,
+            authoritative_provider_state: false,
             gateway_address,
             site_cert_pem: None,
             signature: None,
@@ -313,6 +358,17 @@ impl StateBroadcast {
             grid_id: None,
             signals_address: None,
         }
+    }
+
+    /// Mark this snapshot as an authoritative replacement of the origin's
+    /// provider inventory.
+    ///
+    /// Use this for provider-state publications, including an empty snapshot
+    /// that withdraws every provider previously advertised by the origin.
+    #[must_use]
+    pub fn with_authoritative_provider_state(mut self) -> Self {
+        self.authoritative_provider_state = true;
+        self
     }
 
     /// Attach the signals `host:port` this site serves peers on.
@@ -392,10 +448,22 @@ impl StateBroadcast {
     /// Return this broadcast's invalidation key.
     #[must_use]
     pub fn key(&self) -> StateBroadcastKey {
+        let kind = self.key_kind();
         StateBroadcastKey {
             origin_site: self.origin_site.clone(),
             revision: self.revision,
-            kind: self.key_kind(),
+            grid_id: (kind == StateBroadcastKeyKind::State)
+                .then(|| self.grid_id.clone())
+                .flatten(),
+            kind,
+        }
+    }
+
+    /// Return the origin and Grid ID that scope provider-state replacement.
+    fn provider_state_scope(&self) -> ProviderStateScope {
+        ProviderStateScope {
+            origin_site: self.origin_site.clone(),
+            grid_id: self.grid_id.clone(),
         }
     }
 
@@ -412,7 +480,8 @@ impl StateBroadcast {
     /// (gateway address and/or site cert PEM) with no CRDT state.
     #[must_use]
     fn is_metadata_only(&self) -> bool {
-        self.snapshot.providers.is_empty()
+        !self.authoritative_provider_state
+            && self.snapshot.providers.is_empty()
             && self.snapshot.capabilities.is_empty()
             && self.snapshot.tenant_spend.is_empty()
     }
@@ -428,7 +497,9 @@ impl StateBroadcast {
     /// its origin.
     #[must_use]
     fn carries_provider_state(&self) -> bool {
-        !self.snapshot.providers.is_empty() || !self.snapshot.capabilities.is_empty()
+        self.authoritative_provider_state
+            || !self.snapshot.providers.is_empty()
+            || !self.snapshot.capabilities.is_empty()
     }
 
     /// Return true when this payload only advertises gateway or signals addresses.
@@ -490,15 +561,28 @@ impl StateBroadcast {
             .filter(|provider| provider.capacity_weight != 1)
             .map(|provider| (provider_capacity_key(provider), provider.capacity_weight))
             .collect::<BTreeMap<_, _>>();
+        let provider_tools = self
+            .snapshot
+            .providers
+            .values()
+            .filter(|provider| !provider.tools.is_empty())
+            .map(|provider| (provider_capacity_key(provider), provider.tools.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let provider_state_extension = ProviderStateExtensionV1 {
+            authoritative_provider_state: self.authoritative_provider_state,
+            provider_tools,
+        };
+        let carries_provider_state_extension = provider_state_extension.authoritative_provider_state
+            || !provider_state_extension.provider_tools.is_empty();
         let carries_extension = self.gateway_address.is_some()
             || self.site_cert_pem.is_some()
             || self.signature.is_some()
             || self.signed_at_ms.is_some()
             || self.grid_id.is_some()
             || !provider_capacity_weights.is_empty()
-            || self.signals_address.is_some();
+            || self.signals_address.is_some()
+            || carries_provider_state_extension;
         if carries_extension {
-            // Borrowed fields in `BroadcastExtension` order, so nothing is cloned.
             let ext = (
                 &self.gateway_address,
                 &self.site_cert_pem,
@@ -508,8 +592,21 @@ impl StateBroadcast {
                 &provider_capacity_weights,
             );
             bincode::serde::encode_into_std_write(ext, &mut bytes, bincode::config::standard())?;
-            if self.signals_address.is_some() {
+            if self.signals_address.is_some() || carries_provider_state_extension {
                 bincode::serde::encode_into_std_write(&self.signals_address, &mut bytes, bincode::config::standard())?;
+            }
+            if carries_provider_state_extension {
+                let payload = bincode::serde::encode_to_vec(&provider_state_extension, bincode::config::standard())?;
+                let payload_length = u32::try_from(payload.len()).map_err(|_error| {
+                    bincode::error::EncodeError::Other("provider-state extension exceeds the frame length limit")
+                })?;
+                let header = ProviderStateExtensionHeader {
+                    magic: PROVIDER_STATE_EXTENSION_MAGIC,
+                    payload_length,
+                    version: PROVIDER_STATE_EXTENSION_VERSION_V1,
+                };
+                bincode::serde::encode_into_std_write(header, &mut bytes, bincode::config::standard())?;
+                bytes.extend_from_slice(&payload);
             }
         }
         Ok(bytes)
@@ -535,21 +632,29 @@ impl StateBroadcast {
     ///
     /// Returns a bincode decode error if `bytes` is not a valid
     /// [`StateBroadcast`] payload.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "extension fields (capacity weights, tools) must be applied to providers in one decode pass"
+    )]
     pub fn decode(bytes: &[u8]) -> Result<Self, bincode::error::DecodeError> {
         let (mut v1, consumed): (StateBroadcastV1, usize) =
             bincode::serde::decode_from_slice(bytes, bincode::config::standard())?;
 
         let remaining = bytes.get(consumed..).unwrap_or(&[]);
-        let (ext, signals_address) = Self::decode_extension(remaining);
+        let (ext, signals_address, provider_state_extension) = Self::decode_extension(remaining);
         for provider in v1.snapshot.providers.values_mut() {
-            if let Some(weight) = ext.provider_capacity_weights.get(&provider_capacity_key(provider))
+            let key = provider_capacity_key(provider);
+            if let Some(weight) = ext.provider_capacity_weights.get(&key)
                 && !apply_capacity_weight(provider, *weight)
             {
                 tracing::warn!(
-                    provider = %provider_capacity_key(provider),
+                    provider = %key,
                     capacity_weight = *weight,
                     "ignoring out-of-range remote provider capacity weight"
                 );
+            }
+            if let Some(tools) = provider_state_extension.provider_tools.get(&key) {
+                provider.tools.clone_from(tools);
             }
         }
 
@@ -558,6 +663,7 @@ impl StateBroadcast {
             origin_site: v1.origin_site,
             revision: v1.revision,
             snapshot: v1.snapshot,
+            authoritative_provider_state: provider_state_extension.authoritative_provider_state,
             gateway_address: ext.gateway_address,
             site_cert_pem: ext.site_cert_pem,
             signature: ext.signature,
@@ -574,21 +680,26 @@ impl StateBroadcast {
         clippy::too_many_lines,
         reason = "ordered decoding of every historical extension shape is one compatibility chain"
     )]
-    fn decode_extension(remaining: &[u8]) -> (BroadcastExtension, Option<String>) {
+    fn decode_extension(remaining: &[u8]) -> (BroadcastExtension, Option<String>, ProviderStateExtensionV1) {
         /// Decode `remaining` as one historical extension shape and the bytes it used.
         fn shape<T: serde::de::DeserializeOwned>(remaining: &[u8]) -> Option<(T, usize)> {
             bincode::serde::decode_from_slice::<T, _>(remaining, bincode::config::standard()).ok()
         }
         if remaining.is_empty() {
-            return (BroadcastExtension::default(), None);
+            return (BroadcastExtension::default(), None, ProviderStateExtensionV1::default());
         }
         if let Some((ext, used)) = shape::<BroadcastExtension>(remaining) {
-            let signals = remaining
-                .get(used..)
-                .filter(|rest| !rest.is_empty())
-                .and_then(shape::<Option<String>>)
-                .and_then(|(signals, _)| signals);
-            return (ext, signals);
+            let after_extension = remaining.get(used..).unwrap_or(&[]);
+            let Some((signals, signals_used)) = after_extension
+                .is_empty()
+                .then_some((None, 0))
+                .or_else(|| shape::<Option<String>>(after_extension))
+            else {
+                return (ext, None, ProviderStateExtensionV1::default());
+            };
+            let framed = after_extension.get(signals_used..).unwrap_or(&[]);
+            let provider_state = decode_provider_state_extension(framed);
+            return (ext, signals, provider_state);
         }
         let ext = if let Some((ext, _)) = shape::<PreCapacityBroadcastExtension>(remaining) {
             BroadcastExtension {
@@ -619,7 +730,42 @@ impl StateBroadcast {
                 ..BroadcastExtension::default()
             }
         };
-        (ext, None)
+        (ext, None, ProviderStateExtensionV1::default())
+    }
+}
+
+/// Decode a framed provider-state extension, ignoring unknown or malformed
+/// frames so legacy metadata remains usable.
+fn decode_provider_state_extension(remaining: &[u8]) -> ProviderStateExtensionV1 {
+    if remaining.is_empty() {
+        return ProviderStateExtensionV1::default();
+    }
+    let Ok((header, header_length)) =
+        bincode::serde::decode_from_slice::<ProviderStateExtensionHeader, _>(remaining, bincode::config::standard())
+    else {
+        return ProviderStateExtensionV1::default();
+    };
+    if header.magic != PROVIDER_STATE_EXTENSION_MAGIC || header.version != PROVIDER_STATE_EXTENSION_VERSION_V1 {
+        return ProviderStateExtensionV1::default();
+    }
+    let Ok(payload_length) = usize::try_from(header.payload_length) else {
+        return ProviderStateExtensionV1::default();
+    };
+    let Some(payload_end) = header_length.checked_add(payload_length) else {
+        return ProviderStateExtensionV1::default();
+    };
+    let Some(payload) = remaining.get(header_length..payload_end) else {
+        return ProviderStateExtensionV1::default();
+    };
+    let Ok((extension, consumed)) =
+        bincode::serde::decode_from_slice::<ProviderStateExtensionV1, _>(payload, bincode::config::standard())
+    else {
+        return ProviderStateExtensionV1::default();
+    };
+    if consumed == payload.len() {
+        extension
+    } else {
+        ProviderStateExtensionV1::default()
     }
 }
 
@@ -644,7 +790,7 @@ fn provider_capacity_key(provider: &crdt::ProviderState) -> String {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[expect(
     clippy::partial_pub_fields,
-    reason = "kind is internal; callers use origin_site + revision"
+    reason = "grid and lane scope are internal; callers use origin_site + revision"
 )]
 pub struct StateBroadcastKey {
     /// Site that originated the broadcast.
@@ -652,6 +798,11 @@ pub struct StateBroadcastKey {
 
     /// Monotonic origin-local revision.
     pub revision: u64,
+
+    /// Grid ID that owns a provider-state broadcast.
+    ///
+    /// Metadata lanes are site-global and therefore leave this unset.
+    grid_id: Option<String>,
 
     /// Independent invalidation lane.
     ///
@@ -684,7 +835,10 @@ enum StateBroadcastKeyKind {
 
 impl foca::Invalidates for StateBroadcastKey {
     fn invalidates(&self, other: &Self) -> bool {
-        self.origin_site == other.origin_site && self.kind == other.kind && self.revision >= other.revision
+        self.origin_site == other.origin_site
+            && self.grid_id == other.grid_id
+            && self.kind == other.kind
+            && self.revision >= other.revision
     }
 }
 
@@ -748,11 +902,22 @@ pub enum StateBroadcastError {
     },
 }
 
+/// Provider-state revision and ownership scope.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProviderStateScope {
+    /// Site that originated the state.
+    origin_site: String,
+    /// Grid ID that owns the provider snapshot.
+    grid_id: Option<String>,
+}
+
 /// Per-origin metadata retained by the broadcast handler.
 #[derive(Default)]
 struct RetainedOrigins {
-    /// Highest provider-state revision received from each origin.
-    latest_by_origin: BTreeMap<String, u64>,
+    /// Highest provider-state revision received from each origin and Grid ID.
+    latest_by_scope: BTreeMap<ProviderStateScope, u64>,
+    /// Provider network IDs last associated with each origin and Grid ID.
+    provider_networks_by_scope: BTreeMap<ProviderStateScope, BTreeSet<String>>,
     /// Gateway addresses received from each origin site.
     gateway_addrs: BTreeMap<String, String>,
     /// Highest gateway-address revision received from each origin.
@@ -823,8 +988,10 @@ impl RetainedOrigins {
 
     /// Return every origin represented by any retained map.
     fn known_origins(&self) -> BTreeSet<String> {
-        self.latest_by_origin
+        self.latest_by_scope
             .keys()
+            .map(|scope| &scope.origin_site)
+            .chain(self.provider_networks_by_scope.keys().map(|scope| &scope.origin_site))
             .chain(self.gateway_addrs.keys())
             .chain(self.latest_gateway_revision_by_origin.keys())
             .chain(self.cert_pems.keys())
@@ -837,7 +1004,9 @@ impl RetainedOrigins {
 
     /// Remove every revision and metadata value associated with one origin.
     fn remove(&mut self, origin: &str) {
-        self.latest_by_origin.remove(origin);
+        self.latest_by_scope.retain(|scope, _| scope.origin_site != origin);
+        self.provider_networks_by_scope
+            .retain(|scope, _| scope.origin_site != origin);
         self.gateway_addrs.remove(origin);
         self.latest_gateway_revision_by_origin.remove(origin);
         self.cert_pems.remove(origin);
@@ -950,6 +1119,9 @@ pub struct StateBroadcastHandler {
 
     /// Hard bound for per-origin revision and metadata maps.
     max_origins: usize,
+
+    /// Hard bound for provider-state revision and ownership scopes.
+    max_scopes: usize,
 }
 
 impl StateBroadcastHandler {
@@ -977,6 +1149,7 @@ impl StateBroadcastHandler {
         let (signals_tx, _) = watch::channel(BTreeMap::new());
         let (trust_tx, trust_rx) = watch::channel(TrustStore::new());
         let max_origins = max_origins.max(1);
+        let max_scopes = max_origins.saturating_mul(RETAINED_SCOPE_MULTIPLIER).max(1);
         let retained = Arc::new(Mutex::new(RetainedOrigins::default()));
         let control = OriginStateHandle {
             retained: Arc::clone(&retained),
@@ -995,6 +1168,7 @@ impl StateBroadcastHandler {
                 trust_store_tx: trust_tx,
                 trust_store_rx: trust_rx,
                 max_origins,
+                max_scopes,
             },
             control,
         )
@@ -1190,24 +1364,7 @@ impl StateBroadcastHandler {
     /// enforcement point; until then it is a no-op for every unpinned
     /// origin. An origin pinned to more than one key (rotation overlap)
     /// verifies against **any** key in its set.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "signature-presence, timestamp-presence, signature-validity, and freshness-window checks form one \
-                  atomic gate with a shared rejection log message"
-    )]
-    #[expect(
-        clippy::cognitive_complexity,
-        reason = "four independent rejection branches over one broadcast, each with its own log statement, \
-                  read more branchily than they actually are"
-    )]
     fn verify_signature_if_pinned(&self, broadcast: &StateBroadcast) -> Result<(), StateBroadcastError> {
-        /// Rejection log message shared by every failure branch below.
-        ///
-        /// Deliberately carries no payload contents, matching grid#75's
-        /// review request for bounded rejection metrics that never log
-        /// broadcast bodies; `reason` stays a small closed set of values.
-        const REJECTED: &str = "rejecting pinned-origin state broadcast";
-
         let pinned_keys = self
             .trust_store_rx
             .borrow()
@@ -1217,34 +1374,55 @@ impl StateBroadcastHandler {
         if pinned_keys.is_empty() {
             return Ok(());
         }
-        let origin_site = broadcast.origin_site.clone();
-        let Some(signature) = broadcast.signature.as_ref() else {
-            tracing::warn!(origin_site = %origin_site, reason = "missing_signature", REJECTED);
-            return Err(StateBroadcastError::MissingSignature { origin_site });
-        };
-        let Some(signed_at_ms) = broadcast.signed_at_ms else {
-            tracing::warn!(origin_site = %origin_site, reason = "missing_timestamp", REJECTED);
-            return Err(StateBroadcastError::MissingTimestamp { origin_site });
-        };
-        let signable = match broadcast.signable_bytes() {
-            Ok(bytes) => bytes,
-            Err(source) => {
-                tracing::warn!(origin_site = %origin_site, reason = "signable_encode", REJECTED);
-                return Err(StateBroadcastError::SignableEncode { origin_site, source });
-            },
-        };
+        let (signature, signed_at_ms) = Self::required_signature_fields(broadcast)?;
+        let signable = Self::signable_for_verification(broadcast)?;
         let verified = pinned_keys
             .iter()
             .any(|key| crate::signing::verify_ecdsa_p256(key, &signable, signature).is_ok());
         if !verified {
-            tracing::warn!(origin_site = %origin_site, reason = "signature_invalid", REJECTED);
-            return Err(StateBroadcastError::SignatureInvalid { origin_site });
+            tracing::warn!(origin_site = %broadcast.origin_site, reason = "signature_invalid", REJECTED_BROADCAST_LOG);
+            return Err(StateBroadcastError::SignatureInvalid {
+                origin_site: broadcast.origin_site.clone(),
+            });
         }
         if !Self::within_freshness_window(signed_at_ms) {
-            tracing::warn!(origin_site = %origin_site, reason = "timestamp_out_of_window", REJECTED);
-            return Err(StateBroadcastError::TimestampOutOfWindow { origin_site });
+            tracing::warn!(origin_site = %broadcast.origin_site, reason = "timestamp_out_of_window", REJECTED_BROADCAST_LOG);
+            return Err(StateBroadcastError::TimestampOutOfWindow {
+                origin_site: broadcast.origin_site.clone(),
+            });
         }
         Ok(())
+    }
+
+    /// Return the signature and timestamp required for a pinned origin.
+    fn required_signature_fields(broadcast: &StateBroadcast) -> Result<(&[u8], u64), StateBroadcastError> {
+        let Some(signature) = broadcast.signature.as_ref() else {
+            tracing::warn!(origin_site = %broadcast.origin_site, reason = "missing_signature", REJECTED_BROADCAST_LOG);
+            return Err(StateBroadcastError::MissingSignature {
+                origin_site: broadcast.origin_site.clone(),
+            });
+        };
+        let Some(signed_at_ms) = broadcast.signed_at_ms else {
+            tracing::warn!(origin_site = %broadcast.origin_site, reason = "missing_timestamp", REJECTED_BROADCAST_LOG);
+            return Err(StateBroadcastError::MissingTimestamp {
+                origin_site: broadcast.origin_site.clone(),
+            });
+        };
+        Ok((signature, signed_at_ms))
+    }
+
+    /// Encode the bytes authenticated by a pinned origin's signature.
+    fn signable_for_verification(broadcast: &StateBroadcast) -> Result<Vec<u8>, StateBroadcastError> {
+        match broadcast.signable_bytes() {
+            Ok(bytes) => Ok(bytes),
+            Err(source) => {
+                tracing::warn!(origin_site = %broadcast.origin_site, reason = "signable_encode", REJECTED_BROADCAST_LOG);
+                Err(StateBroadcastError::SignableEncode {
+                    origin_site: broadcast.origin_site.clone(),
+                    source,
+                })
+            },
+        }
     }
 
     /// Return true when `signed_at_ms` falls within the accepted freshness
@@ -1297,6 +1475,12 @@ impl StateBroadcastHandler {
         );
         self.remove_origin(&origin);
     }
+
+    /// Return whether the bounded provider-state maps can retain `scope`.
+    fn has_room_for_scope(&self, scope: &ProviderStateScope) -> bool {
+        let retained = self.retained.lock().unwrap_or_else(PoisonError::into_inner);
+        retained.latest_by_scope.contains_key(scope) || retained.latest_by_scope.len() < self.max_scopes
+    }
 }
 
 impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
@@ -1326,13 +1510,27 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
             return Ok((!self.store_metadata(&broadcast)).then(|| broadcast.key()));
         }
 
-        let latest = self
-            .retained
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .latest_by_origin
-            .get(&broadcast.origin_site)
-            .copied();
+        let provider_scope = broadcast.provider_state_scope();
+        if !self.has_room_for_scope(&provider_scope) {
+            tracing::warn!(
+                origin = %broadcast.origin_site,
+                grid_id = ?broadcast.grid_id,
+                max_scopes = self.max_scopes,
+                "SWIM provider-state scope capacity reached; ignoring unknown scope"
+            );
+            return Ok(None);
+        }
+        let (latest, previous_networks) = {
+            let retained = self.retained.lock().unwrap_or_else(PoisonError::into_inner);
+            (
+                retained.latest_by_scope.get(&provider_scope).copied(),
+                retained
+                    .provider_networks_by_scope
+                    .get(&provider_scope)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        };
         if latest.is_some_and(|held| outranks(held, broadcast.revision, max_leased_revision(wall_ms()))) {
             return Ok(None);
         }
@@ -1345,6 +1543,15 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
         }
 
         let carries_provider_state = broadcast.carries_provider_state();
+        let incoming_networks: BTreeSet<String> = broadcast
+            .snapshot
+            .providers
+            .values()
+            .filter(|provider| provider.site_id == broadcast.origin_site)
+            .map(|provider| provider.network_id.clone())
+            .collect();
+        let networks_to_replace: BTreeSet<String> = previous_networks.union(&incoming_networks).cloned().collect();
+        let mut accepted_networks = BTreeSet::new();
         self.state_tx.send_modify(|snap| {
             snap.capabilities.merge(&broadcast.snapshot.capabilities);
             snap.merge_tenant_spend_from_origin(&broadcast.origin_site, &broadcast.snapshot.tenant_spend);
@@ -1352,14 +1559,24 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
             // origin-provider replace below — it doesn't carry an
             // authoritative provider list for this cycle at all.
             if carries_provider_state {
-                snap.replace_origin_providers(&broadcast.origin_site, broadcast.revision, &broadcast.snapshot);
+                accepted_networks = snap.replace_origin_providers_in_networks(
+                    &broadcast.origin_site,
+                    broadcast.revision,
+                    &networks_to_replace,
+                    &broadcast.snapshot,
+                );
             }
         });
-        self.retained
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .latest_by_origin
-            .insert(broadcast.origin_site.clone(), broadcast.revision);
+        let mut retained = self.retained.lock().unwrap_or_else(PoisonError::into_inner);
+        retained
+            .latest_by_scope
+            .insert(provider_scope.clone(), broadcast.revision);
+        if !accepted_networks.is_empty() {
+            retained
+                .provider_networks_by_scope
+                .insert(provider_scope, accepted_networks);
+        }
+        drop(retained);
         Ok(Some(broadcast.key()))
     }
 }
@@ -1384,6 +1601,7 @@ mod tests {
             provider_id: "provider".to_owned(),
             routing_cluster: site.to_owned(),
             models: vec!["model-x".to_owned()],
+            tools: Vec::new(),
             backend_kind: "local".to_owned(),
             capacity_weight: 1,
             phase: ProviderPhase::Available,
@@ -2825,11 +3043,13 @@ mod tests {
         let old = StateBroadcastKey {
             origin_site: "site-p".to_owned(),
             revision: 1,
+            grid_id: None,
             kind: StateBroadcastKeyKind::State,
         };
         let new = StateBroadcastKey {
             origin_site: "site-p".to_owned(),
             revision: 2,
+            grid_id: None,
             kind: StateBroadcastKeyKind::State,
         };
         assert!(new.invalidates(&old), "newer same-origin broadcast must invalidate old");
@@ -2841,11 +3061,13 @@ mod tests {
         let left = StateBroadcastKey {
             origin_site: "site-p".to_owned(),
             revision: 1,
+            grid_id: None,
             kind: StateBroadcastKeyKind::State,
         };
         let right = StateBroadcastKey {
             origin_site: "site-p".to_owned(),
             revision: 1,
+            grid_id: None,
             kind: StateBroadcastKeyKind::State,
         };
         assert!(left.invalidates(&right), "same key must invalidate duplicate");
@@ -2856,11 +3078,13 @@ mod tests {
         let left = StateBroadcastKey {
             origin_site: "site-p".to_owned(),
             revision: 9,
+            grid_id: None,
             kind: StateBroadcastKeyKind::State,
         };
         let right = StateBroadcastKey {
             origin_site: "site-q".to_owned(),
             revision: 1,
+            grid_id: None,
             kind: StateBroadcastKeyKind::State,
         };
         assert!(
@@ -2870,15 +3094,36 @@ mod tests {
     }
 
     #[test]
+    fn different_grid_ids_do_not_invalidate_each_other() {
+        let grid_a = StateBroadcast::new("site-p".to_owned(), 9, snapshot("site-p", 9, 0.4), None)
+            .with_grid_id(Some("grid-a".to_owned()))
+            .key();
+        let grid_b = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.4), None)
+            .with_grid_id(Some("grid-b".to_owned()))
+            .key();
+
+        assert!(
+            !grid_a.invalidates(&grid_b),
+            "one GridNetwork's state must not invalidate another GridNetwork's state"
+        );
+        assert!(
+            !grid_b.invalidates(&grid_a),
+            "GridNetwork state invalidation must remain scope-local in both revision directions"
+        );
+    }
+
+    #[test]
     fn gateway_address_key_does_not_invalidate_state_key() {
         let gateway = StateBroadcastKey {
             origin_site: "site-p".to_owned(),
             revision: 99,
+            grid_id: None,
             kind: StateBroadcastKeyKind::GatewayAddress,
         };
         let state = StateBroadcastKey {
             origin_site: "site-p".to_owned(),
             revision: 1,
+            grid_id: None,
             kind: StateBroadcastKeyKind::State,
         };
 
@@ -3270,16 +3515,19 @@ mod tests {
         let cert = StateBroadcastKey {
             origin_site: "site-p".to_owned(),
             revision: 99,
+            grid_id: None,
             kind: StateBroadcastKeyKind::Cert,
         };
         let gateway = StateBroadcastKey {
             origin_site: "site-p".to_owned(),
             revision: 99,
+            grid_id: None,
             kind: StateBroadcastKeyKind::GatewayAddress,
         };
         let state = StateBroadcastKey {
             origin_site: "site-p".to_owned(),
             revision: 1,
+            grid_id: None,
             kind: StateBroadcastKeyKind::State,
         };
 
@@ -3397,7 +3645,7 @@ mod tests {
     /// `revision` must be unique-and-increasing per call for the same
     /// `origin` — `receive_item` drops a same-or-lower-revision broadcast
     /// from an origin it has already seen as stale, independent of this
-    /// module's own cap logic (see `receive_item`'s `latest_by_origin` check).
+    /// module's own cap logic (see `receive_item`'s `latest_by_scope` check).
     fn receive_tenant_spend_broadcast(
         handler: &mut StateBroadcastHandler,
         origin: &str,
@@ -3478,6 +3726,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the eviction proof covers two GridNetwork scopes, metadata, and a lower-revision restart"
+    )]
     fn coordinated_eviction_removes_all_origin_state_before_next_item() {
         let (mut handler, origin_state) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 4);
         let cert = "public-cert";
@@ -3487,11 +3739,20 @@ mod tests {
             snapshot("site-a", 10, 0.4),
             Some("10.0.0.1:8443".to_owned()),
         )
+        .with_grid_id(Some("grid-a".to_owned()))
         .with_cert(Some(cert.to_owned()));
+        let mut other_snapshot = snapshot("site-a", 11, 0.5);
+        other_snapshot.providers.values_mut().for_each(|provider| {
+            provider.network_id = "net-b".to_owned();
+        });
+        let other =
+            StateBroadcast::new("site-a".to_owned(), 11, other_snapshot, None).with_grid_id(Some("grid-b".to_owned()));
         assert!(receive(&mut handler, &original).is_some());
+        assert!(receive(&mut handler, &other).is_some());
         origin_state.remove_origin("site-a");
 
         assert!(handler.snapshot().provider("net", "site-a", "provider").is_none());
+        assert!(handler.snapshot().provider("net-b", "site-a", "provider").is_none());
         assert!(handler.gateway_address_for_site("site-a").is_none());
         assert!(handler.cert_pem_for_site("site-a").is_none());
 
@@ -3500,7 +3761,8 @@ mod tests {
             1,
             snapshot("site-a", 1, 0.8),
             Some("10.0.0.9:8443".to_owned()),
-        );
+        )
+        .with_grid_id(Some("grid-a".to_owned()));
         assert!(
             receive(&mut handler, &restarted).is_some(),
             "eviction must clear the old revision watermark so a restarted origin can rejoin"
@@ -3533,5 +3795,352 @@ mod tests {
             handler.snapshot().provider("net", "site-b", "provider").is_none(),
             "capacity eviction must remove provider state with metadata"
         );
+    }
+
+    #[test]
+    fn provider_state_scope_maps_are_hard_bounded() {
+        let (mut handler, _origin_state) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 1);
+        for index in 0..=RETAINED_SCOPE_MULTIPLIER {
+            let network = format!("net-{index}");
+            let mut snap = GridStateSnapshot::new("site-a".to_owned());
+            let mut provider = provider_state("provider", vec!["model".to_owned()], Vec::new(), 1);
+            provider.network_id.clone_from(&network);
+            snap.upsert_provider(provider);
+            let broadcast =
+                StateBroadcast::new("site-a".to_owned(), 1, snap, None).with_grid_id(Some(format!("grid-{index}")));
+            drop(receive(&mut handler, &broadcast));
+        }
+
+        let retained = handler.retained.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(retained.latest_by_scope.len(), RETAINED_SCOPE_MULTIPLIER);
+        assert_eq!(retained.provider_networks_by_scope.len(), RETAINED_SCOPE_MULTIPLIER);
+        drop(retained);
+        assert!(
+            handler
+                .snapshot()
+                .provider(&format!("net-{RETAINED_SCOPE_MULTIPLIER}"), "site-a", "provider")
+                .is_none(),
+            "the first scope past the configured bound must not merge provider state"
+        );
+    }
+
+    #[test]
+    fn provider_tools_survive_broadcast_round_trip() {
+        let mut snap = GridStateSnapshot::new("site-a".to_owned());
+        snap.upsert_provider(provider_state(
+            "tool/my-mcp",
+            Vec::new(),
+            vec!["web-search".to_owned(), "code-exec".to_owned()],
+            7,
+        ));
+        let broadcast = StateBroadcast::new("site-a".to_owned(), 7, snap, Some("10.0.0.1:8443".to_owned()))
+            .with_signals_address(Some("10.0.0.1:9091".to_owned()));
+
+        let bytes = broadcast.encode().unwrap_or_else(|_| std::process::abort());
+        let decoded = StateBroadcast::decode(&bytes).unwrap_or_else(|_| std::process::abort());
+        let provider = decoded
+            .snapshot
+            .provider("net", "site-a", "tool/my-mcp")
+            .unwrap_or_else(|| std::process::abort());
+
+        assert_eq!(provider.tools, vec!["web-search", "code-exec"]);
+        assert_eq!(decoded.signals_address.as_deref(), Some("10.0.0.1:9091"));
+    }
+
+    #[test]
+    fn pre_tools_peer_broadcast_decodes_with_empty_tools() {
+        let v1 = StateBroadcastV1 {
+            version: STATE_BROADCAST_VERSION_V1,
+            origin_site: "site-old".to_owned(),
+            revision: 5,
+            snapshot: snapshot("site-old", 5, 0.4),
+        };
+        let mut bytes =
+            bincode::serde::encode_to_vec(&v1, bincode::config::standard()).unwrap_or_else(|_| std::process::abort());
+        let extension = BroadcastExtension {
+            gateway_address: Some("10.0.0.2:8443".to_owned()),
+            site_cert_pem: None,
+            signature: None,
+            signed_at_ms: None,
+            grid_id: Some("grid-1".to_owned()),
+            provider_capacity_weights: BTreeMap::new(),
+        };
+        bincode::serde::encode_into_std_write(extension, &mut bytes, bincode::config::standard())
+            .unwrap_or_else(|_| std::process::abort());
+        bincode::serde::encode_into_std_write(Some("10.0.0.2:9091"), &mut bytes, bincode::config::standard())
+            .unwrap_or_else(|_| std::process::abort());
+
+        let decoded = StateBroadcast::decode(&bytes).unwrap_or_else(|_| std::process::abort());
+        let provider = decoded
+            .snapshot
+            .provider("net", "site-old", "provider")
+            .unwrap_or_else(|| std::process::abort());
+
+        assert_eq!(decoded.gateway_address.as_deref(), Some("10.0.0.2:8443"));
+        assert_eq!(decoded.grid_id.as_deref(), Some("grid-1"));
+        assert_eq!(decoded.signals_address.as_deref(), Some("10.0.0.2:9091"));
+        assert!(provider.tools.is_empty(), "pre-tools peer must have empty tools");
+    }
+
+    #[test]
+    fn pre_tools_decoder_keeps_signals_address_when_tools_follow_it() {
+        let mut snap = GridStateSnapshot::new("site-a".to_owned());
+        snap.upsert_provider(provider_state("tool/my-mcp", Vec::new(), vec!["search".to_owned()], 3));
+        let broadcast = StateBroadcast::new("site-a".to_owned(), 3, snap, None)
+            .with_signals_address(Some("10.0.0.1:9091".to_owned()));
+        let bytes = broadcast.encode().unwrap_or_else(|_| std::process::abort());
+        let (_, base_used): (StateBroadcastV1, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                .unwrap_or_else(|_| std::process::abort());
+        let after_base = bytes.get(base_used..).unwrap_or(&[]);
+        let (_, extension_used): (BroadcastExtension, usize) =
+            bincode::serde::decode_from_slice(after_base, bincode::config::standard())
+                .unwrap_or_else(|_| std::process::abort());
+        let after_extension = after_base.get(extension_used..).unwrap_or(&[]);
+        let (signals, signals_used): (Option<String>, usize) =
+            bincode::serde::decode_from_slice(after_extension, bincode::config::standard())
+                .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(signals.as_deref(), Some("10.0.0.1:9091"));
+        assert!(
+            after_extension.get(signals_used..).is_some_and(|tail| !tail.is_empty()),
+            "the pre-tools decoder must leave the framed tool extension as ignorable trailing bytes"
+        );
+    }
+
+    #[test]
+    fn tool_free_signable_bytes_keep_the_pre_tools_layout() {
+        let broadcast = StateBroadcast::new("site-a".to_owned(), 3, snapshot("site-a", 3, 0.4), None)
+            .with_grid_id(Some("grid-1".to_owned()))
+            .with_signed_at(Some(42))
+            .with_signals_address(Some("10.0.0.1:9091".to_owned()));
+
+        assert_eq!(
+            broadcast.signable_bytes().unwrap_or_else(|_| std::process::abort()),
+            pre_tools_signable_bytes(&broadcast),
+            "tool-free signed broadcasts must stay verifiable across the rolling upgrade"
+        );
+    }
+
+    #[test]
+    fn signed_tool_extension_fails_closed_across_pre_tools_peers() {
+        let mut snap = GridStateSnapshot::new("site-a".to_owned());
+        snap.upsert_provider(provider_state("tool/my-mcp", Vec::new(), vec!["search".to_owned()], 3));
+        let broadcast = StateBroadcast::new("site-a".to_owned(), 3, snap, None)
+            .with_grid_id(Some("grid-1".to_owned()))
+            .with_signed_at(Some(42));
+        let legacy = pre_tools_signable_bytes(&broadcast);
+        let current = broadcast.signable_bytes().unwrap_or_else(|_| std::process::abort());
+        let (key, public_key) = generate_signing_key_and_pubkey();
+        let old_signature = crate::signing::sign_ecdsa_p256(&key, &legacy).unwrap_or_else(|_| std::process::abort());
+        let new_signature = crate::signing::sign_ecdsa_p256(&key, &current).unwrap_or_else(|_| std::process::abort());
+
+        assert_ne!(legacy, current, "tools must participate in signed bytes");
+        assert!(
+            crate::signing::verify_ecdsa_p256(&public_key, &current, &old_signature).is_err(),
+            "new peers must reject a legacy signature that does not authenticate tools"
+        );
+        assert!(
+            crate::signing::verify_ecdsa_p256(&public_key, &legacy, &new_signature).is_err(),
+            "pre-tools peers must reject a signature over an extension they cannot authenticate"
+        );
+    }
+
+    #[test]
+    fn signed_tool_extension_verifies_and_restores_tools_on_current_peers() {
+        let mut snap = GridStateSnapshot::new("site-a".to_owned());
+        snap.upsert_provider(provider_state("tool/my-mcp", Vec::new(), vec!["search".to_owned()], 3));
+        let unsigned = StateBroadcast::new("site-a".to_owned(), 3, snap, None)
+            .with_grid_id(Some("grid-1".to_owned()))
+            .with_signed_at(Some(now_ms()));
+        let (key, public_key) = generate_signing_key_and_pubkey();
+        let signature = crate::signing::sign_ecdsa_p256(
+            &key,
+            &unsigned.signable_bytes().unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let mut handler = StateBroadcastHandler::new("site-local".to_owned());
+        handler
+            .trust_store_sender()
+            .send_modify(|store| drop(store.insert("site-a".to_owned(), vec![public_key])));
+
+        let accepted = receive(&mut handler, &unsigned.with_signature(Some(signature)));
+        let tools = handler
+            .snapshot()
+            .provider("net", "site-a", "tool/my-mcp")
+            .map(|provider| provider.tools.clone());
+
+        assert!(accepted.is_some(), "the authenticated tool broadcast must be accepted");
+        assert_eq!(tools, Some(vec!["search".to_owned()]));
+    }
+
+    #[test]
+    fn authoritative_empty_snapshot_withdraws_every_origin_provider() {
+        let mut handler = StateBroadcastHandler::new("site-local".to_owned());
+        let initial = StateBroadcast::new("site-a".to_owned(), 1, snapshot("site-a", 1, 0.4), None);
+        let withdrawal = StateBroadcast::new(
+            "site-a".to_owned(),
+            2,
+            GridStateSnapshot::new("site-a".to_owned()),
+            None,
+        )
+        .with_authoritative_provider_state();
+
+        drop(receive(&mut handler, &initial));
+        let withdrawal_key = receive(&mut handler, &withdrawal);
+
+        assert!(
+            withdrawal.carries_grid_state(),
+            "the empty withdrawal must use the state lane"
+        );
+        assert!(withdrawal_key.is_some(), "the empty withdrawal must be re-gossiped");
+        assert!(
+            handler.snapshot().provider("net", "site-a", "provider").is_none(),
+            "an authoritative empty snapshot must remove the origin's retained provider"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "two scoped snapshots and one withdrawal form one cross-network regression proof"
+    )]
+    fn authoritative_empty_snapshot_withdraws_only_its_grid_scope() {
+        let mut handler = StateBroadcastHandler::new("site-local".to_owned());
+        let mut snapshot_a = GridStateSnapshot::new("site-a".to_owned());
+        let mut provider_a = provider_state("provider-a", vec!["model-a".to_owned()], Vec::new(), 1);
+        provider_a.network_id = "net-a".to_owned();
+        snapshot_a.upsert_provider(provider_a);
+        let mut snapshot_b = GridStateSnapshot::new("site-a".to_owned());
+        let mut provider_b = provider_state("provider-b", vec!["model-b".to_owned()], Vec::new(), 1);
+        provider_b.network_id = "net-b".to_owned();
+        snapshot_b.upsert_provider(provider_b);
+        let initial_a =
+            StateBroadcast::new("site-a".to_owned(), 9, snapshot_a, None).with_grid_id(Some("grid-a".to_owned()));
+        let initial_b =
+            StateBroadcast::new("site-a".to_owned(), 1, snapshot_b, None).with_grid_id(Some("grid-b".to_owned()));
+        let withdrawal_a = StateBroadcast::new(
+            "site-a".to_owned(),
+            10,
+            GridStateSnapshot::new("site-a".to_owned()),
+            None,
+        )
+        .with_grid_id(Some("grid-a".to_owned()))
+        .with_authoritative_provider_state();
+
+        drop(receive(&mut handler, &initial_a));
+        drop(receive(&mut handler, &initial_b));
+        drop(receive(&mut handler, &withdrawal_a));
+
+        assert!(
+            handler.snapshot().provider("net-a", "site-a", "provider-a").is_none(),
+            "an empty GridNetwork snapshot must withdraw that scope's provider"
+        );
+        assert!(
+            handler.snapshot().provider("net-b", "site-a", "provider-b").is_some(),
+            "an empty GridNetwork snapshot must preserve the origin's other network"
+        );
+    }
+
+    #[test]
+    fn inference_and_tool_providers_coexist_in_broadcast() {
+        let mut snap = GridStateSnapshot::new("site-a".to_owned());
+        snap.add_capability(Capability::Model("llama".to_owned()));
+        snap.upsert_provider(provider_state("my-server", vec!["llama".to_owned()], Vec::new(), 3));
+        snap.upsert_provider(provider_state(
+            "tool/my-server",
+            Vec::new(),
+            vec!["search".to_owned()],
+            4,
+        ));
+        let broadcast = StateBroadcast::new("site-a".to_owned(), 4, snap, Some("10.0.0.1:8443".to_owned()));
+        let bytes = broadcast.encode().unwrap_or_else(|_| std::process::abort());
+        let decoded = StateBroadcast::decode(&bytes).unwrap_or_else(|_| std::process::abort());
+        let inference = decoded
+            .snapshot
+            .provider("net", "site-a", "my-server")
+            .unwrap_or_else(|| std::process::abort());
+        let tool = decoded
+            .snapshot
+            .provider("net", "site-a", "tool/my-server")
+            .unwrap_or_else(|| std::process::abort());
+
+        assert_eq!(inference.models, vec!["llama"]);
+        assert!(inference.tools.is_empty());
+        assert_eq!(tool.tools, vec!["search"]);
+        assert!(tool.models.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the utility reproduces every field of the immutable pre-tools wire layout"
+    )]
+    fn pre_tools_signable_bytes(broadcast: &StateBroadcast) -> Vec<u8> {
+        let v1 = StateBroadcastV1 {
+            version: broadcast.version,
+            origin_site: broadcast.origin_site.clone(),
+            revision: broadcast.revision,
+            snapshot: broadcast.snapshot.clone(),
+        };
+        let mut encoded =
+            bincode::serde::encode_to_vec(&v1, bincode::config::standard()).unwrap_or_else(|_| std::process::abort());
+        let provider_capacity_weights = broadcast
+            .snapshot
+            .providers
+            .values()
+            .filter(|provider| provider.capacity_weight != 1)
+            .map(|provider| (provider_capacity_key(provider), provider.capacity_weight))
+            .collect::<BTreeMap<_, _>>();
+        let carries_extension = broadcast.gateway_address.is_some()
+            || broadcast.site_cert_pem.is_some()
+            || broadcast.signed_at_ms.is_some()
+            || broadcast.grid_id.is_some()
+            || !provider_capacity_weights.is_empty()
+            || broadcast.signals_address.is_some();
+        if carries_extension {
+            let extension = BroadcastExtension {
+                gateway_address: broadcast.gateway_address.clone(),
+                site_cert_pem: broadcast.site_cert_pem.clone(),
+                signature: None,
+                signed_at_ms: broadcast.signed_at_ms,
+                grid_id: broadcast.grid_id.clone(),
+                provider_capacity_weights,
+            };
+            bincode::serde::encode_into_std_write(extension, &mut encoded, bincode::config::standard())
+                .unwrap_or_else(|_| std::process::abort());
+            if broadcast.signals_address.is_some() {
+                bincode::serde::encode_into_std_write(
+                    &broadcast.signals_address,
+                    &mut encoded,
+                    bincode::config::standard(),
+                )
+                .unwrap_or_else(|_| std::process::abort());
+            }
+        }
+        let mut signable = SIGNATURE_DOMAIN.to_vec();
+        signable.extend(encoded);
+        signable
+    }
+
+    fn provider_state(id: &str, models: Vec<String>, tools: Vec<String>, revision: u64) -> ProviderState {
+        ProviderState {
+            network_id: "net".to_owned(),
+            site_id: "site-a".to_owned(),
+            provider_id: id.to_owned(),
+            routing_cluster: id.to_owned(),
+            models,
+            tools,
+            backend_kind: "local".to_owned(),
+            capacity_weight: 1,
+            phase: ProviderPhase::Available,
+            metrics: ProviderMetricsSnapshot::default(),
+            access_policy: crdt::ProviderAccessPolicy::default(),
+            revision,
+            writer_id: "site-a".to_owned(),
+        }
     }
 }

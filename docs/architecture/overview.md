@@ -213,22 +213,29 @@ the gateway process that already owns the network hot path.
 
 ## Control-Plane Resources
 
-The implemented inference path uses three cluster-scoped CRDs:
+The implemented control plane uses four cluster-scoped CRDs:
 
 | CRD | Current role |
 |---|---|
 | `GridNetwork` | Defines a logical AI Grid Network: SWIM seeds, TLS settings, gateway references, and optional consumer config generation. |
 | `GridSite` | Represents one participating site or cluster. Tracks discovery, gateway address, public trust material, fingerprint trust, and phase. |
 | `InferenceProvider` | Declares model capacity: model name, backend kind, endpoint, health config, auth strategy, access policy, and provider status. |
+| `AgentToolProvider` | Declares an MCP endpoint, discovers its tools, distributes tool state, and publishes tool discovery candidates. |
 
-`AgentToolProvider` and `AgentToAgentProvider` are schema direction for MCP and
-A2A.  `AgentToolProvider` has a running reconciler that resolves `siteSelector`
-matches and live-probes the endpoint's MCP `tools/list` contract, but does not
-yet distribute discovered tools across sites via SWIM/CRDT, score them, or
-render a routed data-plane path — those remain grid-local only.
-`AgentToAgentProvider`'s resource type exists, but the operator does not yet
-run a controller for it at all.  Inference is the mature reconciled path
-today.
+`AgentToolProvider` has a running reconciler that resolves `siteSelector`
+matches and probes the endpoint's MCP `tools/list` contract. The operator
+distributes discovered tool names through SWIM and CRDT state and publishes
+`mcp_tool` candidates in routing overlays.
+
+This is a discovery and overlay contract, not a complete MCP data-plane
+installation path. The operator-generated consumer Praxis config remains
+model-oriented and projects only `inference_model` candidates. A deployment
+that executes MCP calls must provide a dedicated MCP-capable pipeline and a
+reachable load-balancer cluster for every tool candidate.
+
+`AgentToAgentProvider` is schema direction for A2A. Its resource type exists,
+but the operator does not yet run a controller for it. Inference remains the
+most mature reconciled and routed path today.
 
 See [CRDs](crds.md) for field-level details.
 

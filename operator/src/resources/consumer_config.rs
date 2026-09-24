@@ -4,9 +4,13 @@
 //! a [`RoutingOverlay`].  The generated config includes:
 //!
 //! - `json_body_field` filter (model field → `X-Model` header)
-//! - `intelligent_route` filter with candidates from the overlay
+//! - `intelligent_route` filter with inference candidates from the overlay
 //! - `credential_inject` filter (only when credential-bearing candidates exist)
-//! - `load_balancer` filter with one cluster entry per unique candidate cluster
+//! - `load_balancer` filter with one cluster entry per unique inference cluster
+//!
+//! Non-inference capabilities remain in the routing overlay for dedicated
+//! data-plane pipelines. They are not projected into this model-oriented
+//! consumer pipeline.
 //!
 //! # Security invariants
 //!
@@ -26,6 +30,13 @@ use crate::{
     crd::grid_network::{ClusterEndpointConfig, GatewayTelemetryConfig, SelectionMode, TransportMode},
     resources::routing_overlay::{RoutingCandidate, RoutingOverlay},
 };
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Candidate kind supported by the generated model-routing pipeline.
+const INFERENCE_MODEL: &str = "inference_model";
 
 // ---------------------------------------------------------------------------
 // Error
@@ -66,6 +77,10 @@ pub enum ConsumerConfigError {
         cluster: String,
     },
 
+    /// The overlay contains no inference candidates for this pipeline.
+    #[error("overlay has no inference_model candidates for the consumer pipeline")]
+    NoInferenceCandidates,
+
     /// A `mutual_tls` cluster endpoint has no SNI (or blank SNI).
     #[error("mutual_tls transport for cluster {cluster:?} requires a non-blank sni")]
     MissingSni {
@@ -104,27 +119,28 @@ pub enum ConsumerConfigError {
 /// The rendered config is a complete, runnable Praxis config that includes
 /// `listeners:`, `filter_chains:`, `admin:`, and `shutdown_timeout_secs`.
 /// It is compatible with the Praxis `intelligent_route` and `credential_inject`
-/// filters.  It never contains credential token bytes.
+/// filters. It includes only `inference_model` candidates and never contains
+/// credential token bytes.
 ///
 /// # Parameters
 ///
-/// - `overlay` — the routing overlay produced by the Grid operator for this gateway.
-/// - `credential_mount_base` — base directory where credential Secrets are mounted inside the consumer pod (e.g.
+/// - `overlay` - the routing overlay produced by the Grid operator for this gateway.
+/// - `credential_mount_base` - base directory where credential Secrets are mounted inside the consumer pod (e.g.
 ///   `/run/secrets/grid-credentials`).
-/// - `cluster_endpoints` — explicit endpoint topology for the `load_balancer` section.  Every unique candidate cluster
-///   must have a matching endpoint entry with explicit transport configuration.  Missing transport or missing SNI on
-///   `mutual_tls` endpoints fail closed.
-/// - `tls_cert_mount_path` — mount path for TLS certificates inside the consumer pod.  Used only when rendering mTLS
+/// - `cluster_endpoints` - explicit endpoint topology for the `load_balancer` section. Every inference cluster must
+///   have a matching endpoint entry with explicit transport configuration.
+/// - `tls_cert_mount_path` - mount path for TLS certificates inside the consumer pod. Used only when rendering mTLS
 ///   cluster entries.
-/// - `listener_port` — HTTP port for the generated listener (`0.0.0.0:{listener_port}`).
+/// - `listener_port` - HTTP port for the generated listener (`0.0.0.0:{listener_port}`).
 ///
 /// # Errors
 ///
 /// Returns [`ConsumerConfigError`] when:
 /// - `overlay.local_site` is blank.
 /// - `credential_mount_base` is blank.
-/// - Any candidate has a blank cluster name.
-/// - Any candidate cluster has no matching endpoint in `cluster_endpoints`.
+/// - The overlay has no inference candidates.
+/// - Any inference candidate has a blank cluster name.
+/// - Any inference cluster has no matching endpoint in `cluster_endpoints`.
 /// - Any cluster endpoint has no `transport` configuration.
 /// - Any `mutual_tls` endpoint has no (or blank) `sni`.
 #[cfg(test)]
@@ -176,11 +192,20 @@ pub(crate) fn generate_consumer_praxis_config_with_telemetry(
     if credential_mount_base.trim().is_empty() {
         return Err(ConsumerConfigError::BlankMountBase);
     }
-    for c in &overlay.candidates {
-        if c.cluster.trim().is_empty() {
+
+    let inference_candidates: Vec<&RoutingCandidate> = overlay
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.kind == INFERENCE_MODEL)
+        .collect();
+    if inference_candidates.is_empty() {
+        return Err(ConsumerConfigError::NoInferenceCandidates);
+    }
+    for candidate in &inference_candidates {
+        if candidate.cluster.trim().is_empty() {
             return Err(ConsumerConfigError::BlankCluster {
-                kind: c.kind.clone(),
-                name: c.name.clone(),
+                kind: candidate.kind.clone(),
+                name: candidate.name.clone(),
             });
         }
     }
@@ -188,7 +213,7 @@ pub(crate) fn generate_consumer_praxis_config_with_telemetry(
         telemetry.validate().map_err(ConsumerConfigError::InvalidTelemetry)?;
     }
 
-    let candidates_yaml = render_candidates(&overlay.candidates);
+    let candidates_yaml = render_candidates(&inference_candidates);
     let selection_policy_yaml = render_selection_policy(overlay.selection_policy.as_ref());
     let local_site = yaml_scalar(&overlay.local_site)?;
     let trace_context_filter = if telemetry.is_some() {
@@ -197,8 +222,8 @@ pub(crate) fn generate_consumer_praxis_config_with_telemetry(
         ""
     };
 
-    let credential_inject_section = render_credential_inject(&overlay.candidates, credential_mount_base);
-    let load_balancer_section = render_load_balancer(&overlay.candidates, cluster_endpoints, tls_cert_mount_path)?;
+    let credential_inject_section = render_credential_inject(&inference_candidates, credential_mount_base);
+    let load_balancer_section = render_load_balancer(&inference_candidates, cluster_endpoints, tls_cert_mount_path)?;
 
     // Listeners section: one public listener referencing the consumer filter chain.
     let mut config = format!(
@@ -334,8 +359,13 @@ pub(crate) fn build_consumer_config_map(
 ///
 /// Each candidate is indented and includes `credential.secretRef` when present.
 /// Token values are never included.
-fn render_candidates(candidates: &[RoutingCandidate]) -> String {
-    candidates.iter().map(render_candidate).collect::<Vec<_>>().join("\n")
+fn render_candidates(candidates: &[&RoutingCandidate]) -> String {
+    candidates
+        .iter()
+        .copied()
+        .map(render_candidate)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Render the explicit Grid-owned request-selection policy.
@@ -428,7 +458,7 @@ fn render_credential_reference(cred: &crate::resources::routing_overlay::Project
     clippy::too_many_lines,
     reason = "BTreeMap collection + format strings for each credential field"
 )]
-fn render_credential_inject(candidates: &[RoutingCandidate], credential_mount_base: &str) -> Option<String> {
+fn render_credential_inject(candidates: &[&RoutingCandidate], credential_mount_base: &str) -> Option<String> {
     // Collect unique (strategy, name, namespace, key) → rendered entry.
     // BTreeMap provides deterministic sorted order by key.
     let mut entries: BTreeMap<(String, String, String, String), String> = BTreeMap::new();
@@ -483,7 +513,7 @@ fn render_credential_inject(candidates: &[RoutingCandidate], credential_mount_ba
 /// `cluster_endpoints` with explicit transport configuration; missing
 /// endpoint, missing transport, or missing SNI on mTLS all fail closed.
 fn render_load_balancer(
-    candidates: &[RoutingCandidate],
+    candidates: &[&RoutingCandidate],
     cluster_endpoints: &[ClusterEndpointConfig],
     tls_cert_mount_path: &str,
 ) -> Result<String, ConsumerConfigError> {
@@ -491,7 +521,7 @@ fn render_load_balancer(
     let endpoint_map: BTreeMap<&str, &ClusterEndpointConfig> =
         cluster_endpoints.iter().map(|ep| (ep.cluster.as_str(), ep)).collect();
 
-    let clusters: BTreeSet<&str> = candidates.iter().map(|c| c.cluster.as_str()).collect();
+    let clusters: BTreeSet<&str> = candidates.iter().map(|candidate| candidate.cluster.as_str()).collect();
     let cluster_lines: Vec<String> = clusters
         .into_iter()
         .map(|cluster_name| {
@@ -829,7 +859,14 @@ mod tests {
         reason = "covers environment fallback, sampling boundaries, and credential rejection"
     )]
     fn telemetry_rejects_invalid_sampling_rates_and_credentials_in_endpoint() {
-        let overlay = simple_overlay(Vec::new());
+        let overlay = simple_overlay(vec![plain_candidate(
+            "inference_model",
+            "model-a",
+            "site-a",
+            "model-cluster",
+            true,
+        )]);
+        let endpoints = [plain_ep("model-cluster", "10.0.0.10:8080")];
         let env_only = GatewayTelemetryConfig {
             otlp_endpoint: None,
             sampling_rate: None,
@@ -842,7 +879,7 @@ mod tests {
         let env_config = generate_consumer_praxis_config_with_telemetry(
             &overlay,
             MOUNT_BASE,
-            &[],
+            &endpoints,
             "/etc/praxis/tls",
             8080,
             Some(&env_only),
@@ -864,7 +901,7 @@ mod tests {
         let empty_config = generate_consumer_praxis_config_with_telemetry(
             &overlay,
             MOUNT_BASE,
-            &[],
+            &endpoints,
             "/etc/praxis/tls",
             8080,
             Some(&empty_endpoint),
@@ -881,7 +918,7 @@ mod tests {
             let result = generate_consumer_praxis_config_with_telemetry(
                 &overlay,
                 MOUNT_BASE,
-                &[],
+                &endpoints,
                 "/etc/praxis/tls",
                 8080,
                 Some(&telemetry),
@@ -941,6 +978,89 @@ mod tests {
         );
         assert!(yaml.contains("model-a"), "candidate name must appear");
         assert!(yaml.contains("gateway-site-a"), "cluster must appear in load_balancer");
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test parses route and load-balancer sections and checks credential omission"
+    )]
+    fn mixed_capability_overlay_projects_only_inference_pipeline() {
+        let overlay = simple_overlay(vec![
+            plain_candidate("inference_model", "model-a", "site-a", "model-cluster", true),
+            credential_candidate(
+                "mcp_tool",
+                "search",
+                "site-a",
+                "tool-cluster",
+                "tool-secret",
+                "default",
+                "token",
+            ),
+        ]);
+        let endpoints = [plain_ep("model-cluster", "10.0.0.10:8080")];
+        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080)
+            .unwrap_or_else(|_| std::process::abort());
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap_or_else(|_| std::process::abort());
+        let filters = parsed["filter_chains"][0]["filters"]
+            .as_sequence()
+            .unwrap_or_else(|| std::process::abort());
+        let route_candidates = filters
+            .iter()
+            .find(|filter| filter["filter"].as_str() == Some("intelligent_route"))
+            .and_then(|filter| filter["candidates"].as_sequence())
+            .unwrap_or_else(|| std::process::abort());
+        let load_balancer_clusters = filters
+            .iter()
+            .find(|filter| filter["filter"].as_str() == Some("load_balancer"))
+            .and_then(|filter| filter["clusters"].as_sequence())
+            .unwrap_or_else(|| std::process::abort());
+
+        assert_eq!(route_candidates.len(), 1, "only inference candidates must be projected");
+        assert_eq!(
+            route_candidates[0]["kind"].as_str(),
+            Some("inference_model"),
+            "projected candidate must retain the inference kind"
+        );
+        assert_eq!(
+            route_candidates[0]["name"].as_str(),
+            Some("model-a"),
+            "projected candidate must retain the model name"
+        );
+        assert_eq!(
+            load_balancer_clusters.len(),
+            1,
+            "only inference clusters must be projected"
+        );
+        assert_eq!(
+            load_balancer_clusters[0]["name"].as_str(),
+            Some("model-cluster"),
+            "load balancer must contain the selected inference cluster"
+        );
+        assert!(!yaml.contains("mcp_tool"), "MCP candidate kind must be omitted");
+        assert!(!yaml.contains("tool-cluster"), "MCP candidate cluster must be omitted");
+        assert!(!yaml.contains("tool-secret"), "MCP credentials must be omitted");
+        assert!(
+            !yaml.contains("filter: credential_inject"),
+            "MCP credentials must not create a credential filter in the inference pipeline"
+        );
+    }
+
+    #[test]
+    fn tool_only_overlay_returns_no_inference_candidates() {
+        let overlay = simple_overlay(vec![plain_candidate(
+            "mcp_tool",
+            "search",
+            "site-a",
+            "tool-cluster",
+            true,
+        )]);
+        let result = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &[], "/etc/praxis/tls", 8080);
+
+        assert!(
+            matches!(result, Err(ConsumerConfigError::NoInferenceCandidates)),
+            "tool-only overlays must not produce an invalid model-routing config"
+        );
     }
 
     #[test]

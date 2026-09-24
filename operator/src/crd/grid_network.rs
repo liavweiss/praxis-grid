@@ -751,9 +751,11 @@ pub struct GatewayRef {
     /// When absent or `enabled: false`, this gateway behaves exactly as before —
     /// only the routing overlay `ConfigMap` is applied.  When `enabled: true`, the
     /// operator additionally renders a consumer Praxis `ConfigMap` containing the
-    /// `intelligent_route` candidates (with credential `secretRef` data), a
-    /// `credential_inject` section for credential-bearing candidates, and a
-    /// `load_balancer` section with one cluster entry per unique candidate cluster.
+    /// inference-model `intelligent_route` candidates (with credential
+    /// `secretRef` data), a `credential_inject` section for credential-bearing
+    /// inference candidates, and a `load_balancer` section with one cluster
+    /// entry per unique inference cluster. Other capability kinds remain in the
+    /// routing overlay for dedicated data-plane pipelines.
     ///
     /// The generated `ConfigMap` contains no token bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -765,10 +767,11 @@ pub struct GatewayRef {
 /// When `enabled` is `true` on a [`GatewayRef`], the `GridNetwork` controller
 /// renders a `praxis.yaml`-keyed `ConfigMap` in the gateway namespace in addition
 /// to the normal routing overlay `ConfigMap`.  The generated config includes the
-/// `intelligent_route` candidates, `credential_inject` (when credential-bearing
-/// candidates are present), and a `load_balancer` section.
+/// inference-model `intelligent_route` candidates, `credential_inject` (when
+/// credential-bearing inference candidates are present), and a `load_balancer`
+/// section.
 ///
-/// Every cluster referenced by a routing candidate must have a matching
+/// Every cluster referenced by a projected inference candidate must have a matching
 /// `clusterEndpoints` entry.  Missing endpoint topology causes config generation
 /// to fail with status reason `MissingClusterEndpoint` instead of rendering an
 /// incomplete `load_balancer` cluster.
@@ -804,10 +807,10 @@ pub struct ConsumerConfig {
 
     /// Endpoint topology for the generated `load_balancer` section.
     ///
-    /// Each entry maps a routing candidate cluster name to a reachable endpoint
-    /// address with explicit transport configuration.  Every cluster referenced
-    /// by a routing candidate must have a matching entry here with a non-`None`
-    /// `transport` field.
+    /// Each entry maps an inference candidate cluster name to a reachable endpoint
+    /// address with explicit transport configuration. Every cluster referenced
+    /// by a projected inference candidate must have a matching entry here with a
+    /// non-`None` `transport` field.
     ///
     /// Missing endpoint topology causes config generation to fail with
     /// `MissingClusterEndpoint`.  Missing transport fails with
@@ -819,7 +822,8 @@ pub struct ConsumerConfig {
     /// In local Kind validation, the xtask harness discovers `NodePort` addresses
     /// and populates this field in the test fixture.
     ///
-    /// Default: empty — valid only when the rendered overlay has no candidates.
+    /// Default: empty. Supply entries before enabling generated consumer config
+    /// for an overlay containing inference candidates.
     #[serde(default)]
     pub cluster_endpoints: Vec<ClusterEndpointConfig>,
 
@@ -1020,9 +1024,9 @@ pub struct EndpointTransport {
 
 /// Endpoint configuration for one consumer `load_balancer` cluster.
 ///
-/// Maps a routing candidate cluster name to a reachable provider gateway
-/// endpoint with explicit transport intent.  Every cluster referenced by
-/// a routing candidate must have a matching entry.
+/// Maps an inference candidate cluster name to a reachable provider gateway
+/// endpoint with explicit transport intent. Every cluster referenced by a
+/// projected inference candidate must have a matching entry.
 ///
 /// # Transport requirement
 ///
@@ -1034,7 +1038,7 @@ pub struct EndpointTransport {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterEndpointConfig {
-    /// Cluster name — must match a `candidate.cluster` value in the routing overlay.
+    /// Cluster name - must match a projected inference `candidate.cluster` value.
     pub cluster: String,
 
     /// Reachable endpoint address (`host:port`).

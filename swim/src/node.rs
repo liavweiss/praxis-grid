@@ -7,7 +7,12 @@
 //! The runtime is **not** thread-safe; run the node from a single task and pass
 //! only [`AccumulatedOutput`] across task boundaries.
 
-use std::{collections::BTreeMap, num::NonZeroU32, time::Duration};
+use std::{
+    collections::BTreeMap,
+    net::{Ipv6Addr, SocketAddr, SocketAddrV6},
+    num::{NonZeroU32, NonZeroUsize},
+    time::Duration,
+};
 
 use crdt::GridStateSnapshot;
 use rand::{SeedableRng as _, rngs::SmallRng};
@@ -32,6 +37,65 @@ use crate::{
 /// backward-compatible serialization.  `SmallRng` is adequate for gossip-target
 /// randomization (not a cryptographic use).
 type GridFoca = foca::Foca<NodeId, foca::BincodeCodec<bincode::config::Configuration>, SmallRng, StateBroadcastHandler>;
+
+// ---------------------------------------------------------------------------
+// Public types and constants
+// ---------------------------------------------------------------------------
+
+/// Maximum complete datagram emitted by the SWIM transport.
+pub const MAX_SWIM_PACKET_BYTES: usize = 1_400;
+
+/// Maximum Kubernetes DNS-subdomain length used for a site identity.
+const MAX_SITE_NAME_BYTES: usize = 253;
+
+/// Network-order length prefix foca adds before each custom broadcast.
+const CUSTOM_BROADCAST_LENGTH_PREFIX_BYTES: usize = 2;
+
+/// Failure to encode or queue a state broadcast.
+#[derive(Debug, thiserror::Error)]
+pub enum PublishStateBroadcastError {
+    /// Bincode could not encode the state payload.
+    #[error("failed to encode state broadcast: {0}")]
+    Encode(#[from] bincode::error::EncodeError),
+    /// Foca rejected the encoded payload before queueing it.
+    #[error("failed to queue state broadcast: {0}")]
+    Queue(#[from] foca::Error),
+    /// The payload cannot fit beside a worst-case SWIM broadcast header.
+    #[error("state broadcast is {actual_bytes} bytes, exceeding safe SWIM payload budget of {maximum_bytes} bytes")]
+    TooLarge {
+        /// Encoded payload length.
+        actual_bytes: usize,
+        /// Maximum payload length safe for every valid site identity.
+        maximum_bytes: usize,
+    },
+}
+
+/// Compute the safe payload budget for a SWIM state broadcast.
+///
+/// `local_id` must be the identity of the publishing node. The calculation
+/// reserves space for that source identity, a worst-case destination identity,
+/// the foca broadcast header, and its custom-item length prefix. A payload
+/// within this bound can be emitted even when ordinary piggyback messages lack
+/// enough remaining space.
+///
+/// # Errors
+///
+/// Returns an encode error if the synthetic header cannot be serialized with
+/// the configured foca codec.
+pub fn state_broadcast_byte_budget(local_id: &NodeId) -> Result<usize, bincode::error::EncodeError> {
+    let worst_case_address = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, u16::MAX, u32::MAX, u32::MAX));
+    let worst_case_dst = NodeId::with_generation("x".repeat(MAX_SITE_NAME_BYTES), worst_case_address, u64::MAX);
+    let header = foca::Header {
+        src: local_id.clone(),
+        src_incarnation: u16::MAX,
+        dst: worst_case_dst,
+        message: foca::Message::Broadcast,
+    };
+    let header_length = bincode::serde::encode_to_vec(header, bincode::config::standard())?.len();
+    Ok(MAX_SWIM_PACKET_BYTES
+        .saturating_sub(header_length)
+        .saturating_sub(CUSTOM_BROADCAST_LENGTH_PREFIX_BYTES))
+}
 
 // ---------------------------------------------------------------------------
 // SwimNode
@@ -290,9 +354,18 @@ impl SwimNode {
     ///
     /// # Errors
     ///
-    /// Returns an error if the broadcast payload cannot be encoded.
-    pub fn publish_state_broadcast(&mut self, broadcast: &StateBroadcast) -> Result<(), bincode::error::EncodeError> {
+    /// Returns an error if the payload cannot be encoded or if foca rejects
+    /// it before queueing, including when it exceeds the safe payload returned
+    /// by [`state_broadcast_byte_budget`].
+    pub fn publish_state_broadcast(&mut self, broadcast: &StateBroadcast) -> Result<(), PublishStateBroadcastError> {
         let bytes = broadcast.encode()?;
+        let maximum_bytes = state_broadcast_byte_budget(self.foca.identity())?;
+        if bytes.len() > maximum_bytes {
+            return Err(PublishStateBroadcastError::TooLarge {
+                actual_bytes: bytes.len(),
+                maximum_bytes,
+            });
+        }
         match self.foca.add_broadcast(&bytes) {
             Ok(true) => {
                 tracing::debug!(origin = %broadcast.origin_site, rev = broadcast.revision, "state broadcast queued");
@@ -300,7 +373,10 @@ impl SwimNode {
             Ok(false) => {
                 tracing::debug!(origin = %broadcast.origin_site, "state broadcast rejected (stale or duplicate)");
             },
-            Err(err) => tracing::warn!(error = %err, "foca add_broadcast failed"),
+            Err(error) => {
+                tracing::warn!(error = %error, bytes = bytes.len(), "foca add_broadcast failed");
+                return Err(PublishStateBroadcastError::Queue(error));
+            },
         }
         Ok(())
     }
@@ -369,7 +445,9 @@ impl SwimNode {
 /// assumed cluster size compiled into the transport.
 fn grid_config() -> foca::Config {
     let expected_sites = NonZeroU32::new(3).unwrap_or(NonZeroU32::MIN);
-    foca::Config::new_wan(expected_sites)
+    let mut config = foca::Config::new_wan(expected_sites);
+    config.max_packet_size = NonZeroUsize::new(MAX_SWIM_PACKET_BYTES).unwrap_or(NonZeroUsize::MIN);
+    config
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +487,7 @@ mod tests {
             provider_id: "provider-1".to_owned(),
             routing_cluster: site.to_owned(),
             models: vec!["model-x".to_owned()],
+            tools: Vec::new(),
             backend_kind: "local".to_owned(),
             capacity_weight: 1,
             phase: ProviderPhase::Available,
@@ -486,6 +565,97 @@ mod tests {
         let bc = StateBroadcast::new("site-a".to_owned(), 1, snap, None);
         node.publish_state_broadcast(&bc)
             .unwrap_or_else(|_| std::process::abort());
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "boundary proof finds both catalogs, exercises foca delivery, and checks the rejection"
+    )]
+    fn publish_state_broadcast_accepts_the_largest_fitting_catalog_and_rejects_the_next() {
+        let id = local_id("site-a", 7946);
+        let byte_budget = state_broadcast_byte_budget(&id).unwrap_or_else(|_| std::process::abort());
+        let candidates = (1_u16..=128)
+            .map(|tool_count| {
+                let mut snap = provider_snap("site-a", 0.2);
+                snap.providers.values_mut().for_each(|provider| {
+                    provider.tools = (0_u16..tool_count)
+                        .map(|index| format!("tool-{index:03}-{}", "x".repeat(48)))
+                        .collect();
+                });
+                StateBroadcast::new("site-a".to_owned(), 1, snap, None)
+            })
+            .collect::<Vec<_>>();
+        let fitting = candidates
+            .iter()
+            .rfind(|broadcast| broadcast.encode().is_ok_and(|bytes| bytes.len() <= byte_budget))
+            .unwrap_or_else(|| std::process::abort());
+        let overflowing = candidates
+            .iter()
+            .find(|broadcast| broadcast.encode().is_ok_and(|bytes| bytes.len() > byte_budget))
+            .unwrap_or_else(|| std::process::abort());
+        let fitting_length = fitting.encode().map_or(usize::MAX, |bytes| bytes.len());
+        let overflowing_length = overflowing.encode().map_or(0, |bytes| bytes.len());
+        let fitting_tool_count = fitting
+            .snapshot
+            .provider("net", "site-a", "provider-1")
+            .map_or(0, |provider| provider.tools.len());
+        let id_a = local_id("site-a", 19_106);
+        let id_b = local_id("site-b", 19_107);
+        let (mut accepted_node, _) = make_node("site-a", 19_106);
+        let (mut receiving_node, _) = make_node("site-b", 19_107);
+        let (mut rejecting_node, _) = make_node("site-a", 19_108);
+        drop(establish_membership(
+            &mut accepted_node,
+            &mut receiving_node,
+            &id_a,
+            &id_b,
+        ));
+
+        accepted_node
+            .publish_state_broadcast(fitting)
+            .unwrap_or_else(|_| std::process::abort());
+        let outbound = accepted_node.broadcast();
+        for message in &outbound.messages {
+            if message.addr == id_b.socket_addr() {
+                drop(receiving_node.handle_data(&message.data));
+            }
+        }
+        let rejected = rejecting_node.publish_state_broadcast(overflowing);
+
+        assert!(
+            fitting_length <= byte_budget,
+            "the accepted catalog must fit the configured packet budget"
+        );
+        assert!(
+            overflowing_length > byte_budget,
+            "the rejected catalog must exceed the configured packet budget"
+        );
+        assert!(
+            matches!(
+                rejected,
+                Err(PublishStateBroadcastError::TooLarge {
+                    actual_bytes,
+                    maximum_bytes,
+                }) if actual_bytes == overflowing_length && maximum_bytes == byte_budget
+            ),
+            "an oversized catalog must surface its exact byte-budget error, got {rejected:?}"
+        );
+        assert!(
+            outbound
+                .messages
+                .iter()
+                .any(|message| { message.addr == id_b.socket_addr() && message.data.len() <= MAX_SWIM_PACKET_BYTES }),
+            "the largest fitting catalog must be emitted in a bounded dedicated broadcast"
+        );
+        assert_eq!(
+            receiving_node
+                .state_snapshot()
+                .provider("net", "site-a", "provider-1")
+                .map_or(0, |provider| provider.tools.len()),
+            fitting_tool_count,
+            "the receiving peer must recover every tool in the largest fitting catalog"
+        );
     }
 
     // -----------------------------------------------------------------------

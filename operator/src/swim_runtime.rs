@@ -448,6 +448,14 @@ fn has_aging_members(tracked: &HashMap<String, TrackedMember>) -> bool {
     tracked.values().any(|t| t.status_changed_at.is_some())
 }
 
+/// A controller request to withdraw one `GridNetwork` scope.
+struct WithdrawalRequest {
+    /// Persisted `GridNetwork` ID used as the retained-state scope.
+    grid_id: String,
+    /// Notified only after the local node publishes the empty state.
+    published: oneshot::Sender<()>,
+}
+
 /// Internal channels owned by the SWIM runtime loop.
 struct RuntimeChannels {
     /// Publishes membership snapshots to readers.
@@ -474,6 +482,12 @@ struct RuntimeChannels {
 
     /// Asks the loop to leave the cluster and stop.
     leave_rx: mpsc::Receiver<()>,
+
+    /// Asks the loop to withdraw anti-entropy for a deleted `GridNetwork` scope.
+    ///
+    /// Each request carries the persisted grid ID and waits for local
+    /// publication of the authoritative-empty snapshot.
+    withdraw_rx: mpsc::Receiver<WithdrawalRequest>,
 }
 
 /// Period between bounded anti-entropy publications of local provider state.
@@ -580,6 +594,7 @@ impl RevisionClock {
 /// Foca intentionally removes a custom broadcast after its transmission
 /// budget is exhausted. A peer that joins later therefore needs a new
 /// transport revision even when the underlying provider state is unchanged.
+#[derive(Clone)]
 struct RetainedStateBroadcast {
     /// Canonical encoded payload with its transport revision normalized to zero.
     canonical_payload: Vec<u8>,
@@ -588,6 +603,15 @@ struct RetainedStateBroadcast {
     /// Last origin-local transport revision assigned by this process.
     last_revision: u64,
 }
+
+/// Retained provider-state payloads, independently keyed by `GridNetwork` ID.
+type RetainedStateBroadcasts = BTreeMap<Option<String>, RetainedStateBroadcast>;
+
+/// Pending authoritative-empty state publications keyed by persisted grid ID.
+///
+/// These tombstones replace the normal retained provider state until the local
+/// SWIM node has accepted an empty snapshot with a newer transport revision.
+type PendingWithdrawals = BTreeMap<String, Vec<oneshot::Sender<()>>>;
 
 impl RetainedStateBroadcast {
     /// Retain a changed state payload and assign a restart-safe transport revision.
@@ -627,6 +651,103 @@ impl RetainedStateBroadcast {
         self.last_revision = revision;
         self.broadcast.revision = revision;
         self.broadcast.clone()
+    }
+}
+
+/// Update one network's retained state without disturbing other networks.
+fn update_retained_state(
+    retained: &mut RetainedStateBroadcasts,
+    broadcast: swim::StateBroadcast,
+    revision: u64,
+) -> Result<Option<swim::StateBroadcast>, String> {
+    let scope = broadcast.grid_id.clone();
+    let current = retained.remove(&scope);
+    let restore = current.clone();
+    match RetainedStateBroadcast::update(current, broadcast, revision) {
+        Ok((next, outbound)) => {
+            retained.insert(scope, next);
+            Ok(outbound)
+        },
+        Err(error) => {
+            if let Some(previous) = restore {
+                retained.insert(scope, previous);
+            }
+            Err(error)
+        },
+    }
+}
+
+/// Queue `request` as a tombstone and stop anti-entropy for its prior state.
+fn queue_withdrawal(
+    pending: &mut PendingWithdrawals,
+    retained: &mut RetainedStateBroadcasts,
+    request: WithdrawalRequest,
+) {
+    retained.remove(&Some(request.grid_id.clone()));
+    let waiters = pending.entry(request.grid_id).or_default();
+    waiters.retain(|waiter| !waiter.is_closed());
+    waiters.push(request.published);
+}
+
+/// Build the authoritative-empty provider state that withdraws `grid_id`.
+fn withdrawal_broadcast(site_name: &str, grid_id: &str, revision: u64) -> swim::StateBroadcast {
+    swim::StateBroadcast::new(
+        site_name.to_owned(),
+        revision,
+        GridStateSnapshot::new(site_name.to_owned()),
+        None,
+    )
+    .with_grid_id(Some(grid_id.to_owned()))
+    .with_authoritative_provider_state()
+}
+
+/// Publish every pending withdrawal whose next transport revision is available.
+///
+/// A failed publication remains pending as a tombstone. This prevents the old
+/// provider state from being republished while allowing later revision renewal
+/// or transport recovery to complete the withdrawal.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the runtime loop owns all IO and state needed to acknowledge a local withdrawal publication"
+)]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "each pending scope needs an explicit revision, publication, and acknowledgement outcome"
+)]
+async fn publish_pending_withdrawals(
+    pending: &mut PendingWithdrawals,
+    retained: &mut RetainedStateBroadcasts,
+    revisions: &mut RevisionClock,
+    node: &mut SwimNode,
+    site_name: &str,
+    socket: &UdpSocket,
+    timer_tx: &mpsc::Sender<TimerEvent>,
+    tracked: &mut HashMap<String, TrackedMember>,
+    snapshot_tx: &watch::Sender<MembershipSnapshot>,
+    key: &KeyState,
+) {
+    let grid_ids = pending.keys().cloned().collect::<Vec<_>>();
+    for grid_id in grid_ids {
+        let Some(revision) = revisions.take() else {
+            tracing::debug!(grid_id, "SWIM revisions exhausted; withdrawal remains pending");
+            break;
+        };
+        let withdrawal = withdrawal_broadcast(site_name, &grid_id, revision);
+        if let Err(error) = node.publish_state_broadcast(&withdrawal) {
+            tracing::warn!(%grid_id, %error, "failed to publish pending GridNetwork withdrawal");
+            continue;
+        }
+        let output = node.broadcast();
+        drain_output(output, socket, timer_tx, tracked, snapshot_tx, node, key).await;
+        retained.remove(&Some(grid_id.clone()));
+        if let Some(waiters) = pending.remove(&grid_id) {
+            for waiter in waiters {
+                if waiter.send(()).is_err() {
+                    tracing::debug!(%grid_id, "withdrawal waiter ended before local publication");
+                }
+            }
+        }
+        tracing::info!(%grid_id, revision, "published GridNetwork withdrawal");
     }
 }
 
@@ -748,6 +869,9 @@ pub struct SwimHandle {
 
     /// Channel for sending CRDT state broadcasts to the runtime loop.
     broadcast_tx: mpsc::Sender<swim::StateBroadcast>,
+
+    /// Channel for withdrawing anti-entropy state for a deleted `GridNetwork` scope.
+    withdraw_tx: mpsc::Sender<WithdrawalRequest>,
 
     /// Channel for queuing seed addresses to announce at runtime.
     seed_tx: mpsc::Sender<Vec<SocketAddr>>,
@@ -919,6 +1043,28 @@ impl SwimHandle {
             TrySendError::Full(_) => BroadcastError::ChannelFull,
             TrySendError::Closed(_) => BroadcastError::ChannelClosed,
         })
+    }
+
+    /// Withdraw all anti-entropy state for the given `GridNetwork` scope.
+    ///
+    /// Call this when a `GridNetwork` is deleted. The returned receiver resolves
+    /// only after the runtime locally publishes a revisioned authoritative-empty
+    /// snapshot for the persisted grid ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BroadcastError::ChannelFull`] or [`BroadcastError::ChannelClosed`]
+    /// if the runtime is under pressure or has exited. A closed returned receiver
+    /// means the runtime exited before local publication completed.
+    pub fn withdraw_scope(&self, grid_id: String) -> Result<oneshot::Receiver<()>, BroadcastError> {
+        let (published, receipt) = oneshot::channel();
+        self.withdraw_tx
+            .try_send(WithdrawalRequest { grid_id, published })
+            .map_err(|e| match e {
+                TrySendError::Full(_) => BroadcastError::ChannelFull,
+                TrySendError::Closed(_) => BroadcastError::ChannelClosed,
+            })?;
+        Ok(receipt)
     }
 
     /// Configure the AES-256-GCM encryption key for SWIM traffic.
@@ -1094,6 +1240,7 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
     let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new(site_name.clone()));
     let (timer_tx, timer_rx) = mpsc::channel::<TimerEvent>(256);
     let (broadcast_tx, broadcast_rx) = mpsc::channel::<swim::StateBroadcast>(32);
+    let (withdraw_tx, withdraw_rx) = mpsc::channel::<WithdrawalRequest>(16);
     let (seed_tx, seed_rx) = mpsc::channel::<Vec<SocketAddr>>(16);
     let (leave_tx, leave_rx) = mpsc::channel::<()>(1);
     let (key_tx, key_rx) = watch::channel(config.key.clone());
@@ -1106,6 +1253,7 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
         broadcast_rx,
         seed_rx,
         leave_rx,
+        withdraw_rx,
     };
 
     tracing::info!(
@@ -1144,6 +1292,7 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
         snapshot_rx,
         state_rx,
         broadcast_tx,
+        withdraw_tx,
         seed_tx,
         key_tx,
         gateway_tx,
@@ -1220,7 +1369,8 @@ async fn run_loop(
         return;
     };
     let mut next_gateway_republish_at = Instant::now();
-    let mut retained_state_broadcast: Option<RetainedStateBroadcast> = None;
+    let mut retained_state_broadcasts = RetainedStateBroadcasts::new();
+    let mut pending_withdrawals = PendingWithdrawals::new();
     let mut next_state_republish_at = Instant::now() + STATE_REPUBLISH_INTERVAL;
     let dead_member_ttl = Duration::from_secs(
         std::env::var("GRID_SWIM_DEAD_MEMBER_TTL_SECS")
@@ -1344,24 +1494,26 @@ async fn run_loop(
                 .await;
             }
             Some(mut bc) = channels.broadcast_rx.recv() => {
+                if bc
+                    .grid_id
+                    .as_deref()
+                    .is_some_and(|grid_id| pending_withdrawals.contains_key(grid_id))
+                {
+                    tracing::debug!(grid_id = ?bc.grid_id, "discarding provider state for pending GridNetwork withdrawal");
+                    continue;
+                }
                 if bc.carries_grid_state() {
                     let Some(revision) = revisions.take() else {
                         tracing::warn!("SWIM revisions exhausted; state publishes on repair after renewal");
-                        if let Ok((retained, _)) = RetainedStateBroadcast::update(retained_state_broadcast.take(), bc, 0) {
-                            retained_state_broadcast = Some(retained);
+                        if let Err(error) = update_retained_state(&mut retained_state_broadcasts, bc, 0) {
+                            tracing::warn!(%error, "failed to retain state broadcast while revisions are exhausted");
                         }
                         next_state_republish_at = Instant::now();
                         continue;
                     };
-                    match RetainedStateBroadcast::update(retained_state_broadcast.take(), bc, revision) {
-                        Ok((retained, Some(outbound))) => {
-                            retained_state_broadcast = Some(retained);
-                            bc = outbound;
-                        }
-                        Ok((retained, None)) => {
-                            retained_state_broadcast = Some(retained);
-                            continue;
-                        }
+                    match update_retained_state(&mut retained_state_broadcasts, bc, revision) {
+                        Ok(Some(outbound)) => bc = outbound,
+                        Ok(None) => continue,
                         Err(e) => {
                             tracing::warn!(error = %e, "failed to encode state broadcast");
                             continue;
@@ -1402,6 +1554,22 @@ async fn run_loop(
                 tracing::info!("SWIM left the cluster");
                 return;
             }
+            Some(request) = channels.withdraw_rx.recv() => {
+                queue_withdrawal(&mut pending_withdrawals, &mut retained_state_broadcasts, request);
+                publish_pending_withdrawals(
+                    &mut pending_withdrawals,
+                    &mut retained_state_broadcasts,
+                    &mut revisions,
+                    &mut node,
+                    &site_name,
+                    &socket,
+                    &channels.timer_tx,
+                    &mut tracked,
+                    &channels.snapshot_tx,
+                    &key,
+                )
+                .await;
+            }
             Some(seeds) = channels.seed_rx.recv() => {
                 // Announce to CRD-declared seed peers at runtime.
                 // Re-announcing to existing members is idempotent (foca ignores them).
@@ -1423,9 +1591,30 @@ async fn run_loop(
             }
             _ = age_tick.tick() => {
                 let now = Instant::now();
+                publish_pending_withdrawals(
+                    &mut pending_withdrawals,
+                    &mut retained_state_broadcasts,
+                    &mut revisions,
+                    &mut node,
+                    &site_name,
+                    &socket,
+                    &channels.timer_tx,
+                    &mut tracked,
+                    &channels.snapshot_tx,
+                    &key,
+                )
+                .await;
                 if now >= next_state_republish_at {
-                    let revision = retained_state_broadcast.as_ref().and_then(|_| revisions.take());
-                    if let (Some(retained), Some(revision)) = (retained_state_broadcast.as_mut(), revision) {
+                    let scopes = retained_state_broadcasts.keys().cloned().collect::<Vec<_>>();
+                    let mut revisions_exhausted = false;
+                    for scope in scopes {
+                        let Some(revision) = revisions.take() else {
+                            revisions_exhausted = true;
+                            break;
+                        };
+                        let Some(retained) = retained_state_broadcasts.get_mut(&scope) else {
+                            continue;
+                        };
                         let bc = retained.republish(revision);
                         if let Err(e) = node.publish_state_broadcast(&bc) {
                             tracing::warn!(error = %e, "failed to encode retained state broadcast");
@@ -1443,8 +1632,8 @@ async fn run_loop(
                             .await;
                         }
                     }
-                    // Without a revision the repair retries on the next tick.
-                    if retained_state_broadcast.is_none() || revision.is_some() {
+                    // Without enough revisions, retry the remaining scopes on the next tick.
+                    if retained_state_broadcasts.is_empty() || !revisions_exhausted {
                         next_state_republish_at = now + STATE_REPUBLISH_INTERVAL;
                     }
                 }
@@ -1984,6 +2173,41 @@ mod tests {
         }
     }
 
+    async fn start_test_runtime(
+        site_name: &str,
+        bind_addr: SocketAddr,
+        seeds: Vec<SocketAddr>,
+        revision_seed: u64,
+    ) -> Arc<SwimHandle> {
+        start(SwimConfig {
+            bind_addr,
+            advertise_addr: Some(bind_addr),
+            site_name: site_name.to_owned(),
+            seeds,
+            ..test_config(revision_seed)
+        })
+        .await
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    async fn wait_until_provider_presence(handle: &SwimHandle, origin_site: &str, present: bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let observed = handle
+                .state_snapshot()
+                .provider("net", origin_site, "provider-a")
+                .is_some();
+            if observed == present {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "provider presence at peer must become {present} after SWIM publication"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     fn test_revision_lease(seed: u64) -> RevisionLease {
         RevisionLease {
             first_revision: seed,
@@ -2329,6 +2553,7 @@ mod tests {
             key_tx,
             gateway_tx,
             runtime_tx: watch::channel(true).0,
+            withdraw_tx: mpsc::channel(16).0,
             leave_tx: mpsc::channel(1).0,
         };
         (handle, snapshot_tx, state_tx)
@@ -2427,6 +2652,7 @@ mod tests {
             provider_id: "provider-x".to_owned(),
             routing_cluster: "site-x".to_owned(),
             models: vec!["model-x".to_owned()],
+            tools: Vec::new(),
             backend_kind: "local".to_owned(),
             capacity_weight: 1,
             phase: crdt::ProviderPhase::Available,
@@ -2496,6 +2722,7 @@ mod tests {
             key_tx,
             gateway_tx,
             runtime_tx: watch::channel(true).0,
+            withdraw_tx: mpsc::channel(16).0,
             leave_tx: mpsc::channel(1).0,
         };
         drop((snapshot_tx, state_tx));
@@ -2526,6 +2753,7 @@ mod tests {
             key_tx,
             gateway_tx,
             runtime_tx: watch::channel(true).0,
+            withdraw_tx: mpsc::channel(16).0,
             leave_tx: mpsc::channel(1).0,
         };
 
@@ -2540,30 +2768,12 @@ mod tests {
 
     #[test]
     fn set_gateway_address_returns_error_without_runtime_receiver() {
-        let (_snapshot_tx, snapshot_rx) = watch::channel(MembershipSnapshot::default());
-        let (_state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
-        let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
-        let (seed_tx, _seed_rx) = mpsc::channel(16);
-        let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
-        let (gateway_tx, gateway_rx) = watch::channel(None);
-        let handle = SwimHandle {
-            site_name: "test".to_owned(),
-            advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
-            signals_address: None,
-            snapshot_rx,
-            state_rx,
-            broadcast_tx,
-            seed_tx,
-            key_tx,
-            gateway_tx,
-            runtime_tx: watch::channel(false).0,
-            leave_tx: mpsc::channel(1).0,
-        };
-        drop(gateway_rx);
-
-        let result = handle.set_gateway_address(Some("10.0.0.5:8080".to_owned()));
+        let (handle, _snapshot_tx, _state_tx) = make_test_handle();
         assert!(
-            matches!(result, Err(SetGatewayError::RuntimeGone)),
+            matches!(
+                handle.set_gateway_address(Some("10.0.0.5:8080".to_owned())),
+                Err(SetGatewayError::RuntimeGone)
+            ),
             "set_gateway_address must report a stopped runtime"
         );
         assert_eq!(
@@ -2662,6 +2872,7 @@ mod tests {
             provider_id: "provider-a".to_owned(),
             routing_cluster: "site-a".to_owned(),
             models: vec!["model-x".to_owned()],
+            tools: Vec::new(),
             backend_kind: "local".to_owned(),
             capacity_weight: 1,
             phase: crdt::ProviderPhase::Available,
@@ -2728,6 +2939,34 @@ mod tests {
     }
 
     #[test]
+    fn retained_state_is_independent_for_each_grid_network() {
+        let mut retained = RetainedStateBroadcasts::new();
+        let grid_a = provider_broadcast(0.1).with_grid_id(Some("grid-a".to_owned()));
+        let grid_b = provider_broadcast(0.2).with_grid_id(Some("grid-b".to_owned()));
+
+        assert!(
+            update_retained_state(&mut retained, grid_a.clone(), 100)
+                .unwrap_or_else(|_| std::process::abort())
+                .is_some()
+        );
+        assert!(
+            update_retained_state(&mut retained, grid_b, 101)
+                .unwrap_or_else(|_| std::process::abort())
+                .is_some()
+        );
+        assert_eq!(retained.len(), 2, "one network must not replace another's repair state");
+        assert!(
+            update_retained_state(&mut retained, grid_a, 102)
+                .unwrap_or_else(|_| std::process::abort())
+                .is_none(),
+            "deduplication remains local to the matching network"
+        );
+        assert_eq!(retained.len(), 2);
+        assert!(retained.contains_key(&Some("grid-a".to_owned())));
+        assert!(retained.contains_key(&Some("grid-b".to_owned())));
+    }
+
+    #[test]
     fn handle_snapshot_starts_empty() {
         let (handle, snapshot_tx, _state_tx) = make_test_handle();
         let snap = handle.snapshot();
@@ -2775,6 +3014,7 @@ mod tests {
             provider_id: "p1".to_owned(),
             routing_cluster: "site-a".to_owned(),
             models: vec!["model-x".to_owned()],
+            tools: Vec::new(),
             backend_kind: "local".to_owned(),
             capacity_weight: 1,
             phase: crdt::ProviderPhase::Available,
@@ -2857,6 +3097,7 @@ mod tests {
             key_tx,
             gateway_tx,
             runtime_tx: watch::channel(true).0,
+            withdraw_tx: mpsc::channel(16).0,
             leave_tx: mpsc::channel(1).0,
         };
         drop((snapshot_tx, state_tx));
@@ -2888,6 +3129,7 @@ mod tests {
             key_tx,
             gateway_tx,
             runtime_tx: watch::channel(true).0,
+            withdraw_tx: mpsc::channel(16).0,
             leave_tx: mpsc::channel(1).0,
         };
         drop(seed_rx);
@@ -2981,6 +3223,35 @@ mod tests {
 
         wait_until_member_alive(&handle1, "node-2").await;
         drop(handle2);
+    }
+
+    #[tokio::test]
+    async fn withdrawal_retracts_scoped_provider_state_at_peer() {
+        let addr1 = reserve_local_addr().await;
+        let addr2 = reserve_local_addr().await;
+        let handle1 = start_test_runtime("node-1", addr1, Vec::new(), 45_000).await;
+        let handle2 = start_test_runtime("node-2", addr2, vec![addr1], 55_000).await;
+        wait_until_member_alive(&handle1, "node-2").await;
+
+        let mut state = provider_broadcast(0.1).with_grid_id(Some("grid-delete".to_owned()));
+        state.origin_site = "node-1".to_owned();
+        for provider in state.snapshot.providers.values_mut() {
+            provider.site_id = "node-1".to_owned();
+            provider.writer_id = "node-1".to_owned();
+        }
+        handle1
+            .publish_state_broadcast(state)
+            .unwrap_or_else(|_| std::process::abort());
+        wait_until_provider_presence(&handle2, "node-1", true).await;
+
+        let receipt = handle1
+            .withdraw_scope("grid-delete".to_owned())
+            .unwrap_or_else(|_| std::process::abort());
+        tokio::time::timeout(Duration::from_secs(5), receipt)
+            .await
+            .unwrap_or_else(|_| std::process::abort())
+            .unwrap_or_else(|_| std::process::abort());
+        wait_until_provider_presence(&handle2, "node-1", false).await;
     }
 
     #[tokio::test]

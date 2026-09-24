@@ -990,6 +990,10 @@ fn hostname_or_default() -> String {
 /// Metrics TLS rotation is detected by bounded requeue rather than a
 /// cluster-wide Secret watch — the operator only reads referenced
 /// Secrets by explicit namespace/name during reconciliation.
+#[expect(
+    clippy::too_many_lines,
+    reason = "controller builder chains three cross-resource watches plus SWIM event plumbing"
+)]
 async fn run_network_controller(
     client: Client,
     ctx: Arc<OperatorCtx>,
@@ -997,6 +1001,7 @@ async fn run_network_controller(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let api = Api::<GridNetwork>::all(client.clone());
     let provider_api = Api::<InferenceProvider>::all(client.clone());
+    let tool_provider_api = Api::<AgentToolProvider>::all(client.clone());
     let site_api = Api::<GridSite>::all(client.clone());
 
     let controller = Controller::new(api, watcher::Config::default())
@@ -1004,6 +1009,11 @@ async fn run_network_controller(
             provider_api,
             watcher::Config::default(),
             grid_network::network_refs_from_inference_provider,
+        )
+        .watches(
+            tool_provider_api,
+            watcher::Config::default(),
+            grid_network::network_refs_from_agent_tool_provider,
         )
         .watches(
             site_api,

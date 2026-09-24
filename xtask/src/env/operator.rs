@@ -54,6 +54,8 @@ pub(crate) const AGENT_TOOL_TEST_SITE: &str = "op-e2e-agent-tool-site";
 pub(crate) const AGENT_TOOL_TEST_PROVIDER_HEALTHY: &str = "op-e2e-agent-tool-healthy";
 /// Name of the `AgentToolProvider` pointed at a deliberately-unreachable endpoint.
 pub(crate) const AGENT_TOOL_TEST_PROVIDER_UNREACHABLE: &str = "op-e2e-agent-tool-unreachable";
+/// Gateway reference name for the `AgentToolProvider` convergence overlay check.
+pub(crate) const AGENT_TOOL_TEST_GATEWAY: &str = "op-e2e-agent-tool-gw";
 /// Name of the `InferenceProvider` with a blank endpoint (expected: reconciles to `Unavailable`).
 pub(crate) const TEST_PROVIDER_INVALID: &str = "op-e2e-invalid";
 /// Name of the `InferenceProvider` whose health probe returns non-2xx (expected: `Degraded`).
@@ -1038,16 +1040,22 @@ fn provider_fixture_json(
 /// Apply the minimal `GridNetwork` + `GridSite` fixtures the
 /// `AgentToolProvider` convergence check needs.
 ///
-/// Neither resource needs a `gatewayRef` or labels: `AgentToolProvider`'s
-/// default `siteSelector` matches every `GridSite` referencing the network,
-/// so a bare `GridSite` is enough to clear site-matching once the network
-/// exists.
+/// The `GridNetwork` includes a `gatewayRef` so the operator renders
+/// a routing overlay `ConfigMap` that the convergence check can
+/// inspect for `mcp_tool` candidates (grid#187).
 pub(crate) fn apply_agent_tool_provider_network_fixtures(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     let network = serde_json::to_string_pretty(&serde_json::json!({
         "apiVersion": "grid.praxis.fast/v1alpha1",
         "kind": "GridNetwork",
         "metadata": { "name": AGENT_TOOL_TEST_NETWORK },
-        "spec": {}
+        "spec": {
+            "seeds": [],
+            "gatewayRefs": [{
+                "name": AGENT_TOOL_TEST_GATEWAY,
+                "namespace": "default",
+                "localSiteName": AGENT_TOOL_TEST_SITE
+            }]
+        }
     }))
     .unwrap_or_else(|e| {
         eprintln!("AgentToolProvider GridNetwork fixture serialization failed: {e}");
@@ -1092,10 +1100,12 @@ pub(crate) fn apply_agent_tool_provider(
 }
 
 /// Delete the `AgentToolProvider` convergence test's `GridNetwork`,
-/// `GridSite`, and `AgentToolProvider` resources if they exist.
+/// `GridSite`, `AgentToolProvider`, and overlay `ConfigMap` resources if they
+/// exist.
 ///
 /// Best-effort: errors are ignored, matching [`cleanup_validation_resources`].
 pub(crate) fn cleanup_agent_tool_provider_test_resources(context: &str) {
+    let overlay_cm = format!("grid-overlay-{AGENT_TOOL_TEST_NETWORK}-{AGENT_TOOL_TEST_GATEWAY}");
     for (kind, name) in [
         ("agenttoolproviders", AGENT_TOOL_TEST_PROVIDER_HEALTHY),
         ("agenttoolproviders", AGENT_TOOL_TEST_PROVIDER_UNREACHABLE),
@@ -1108,6 +1118,20 @@ pub(crate) fn cleanup_agent_tool_provider_test_resources(context: &str) {
                 .status(),
         );
     }
+    drop(
+        Command::new("kubectl")
+            .args([
+                "--context",
+                context,
+                "delete",
+                "configmap",
+                &overlay_cm,
+                "-n",
+                "default",
+                "--ignore-not-found",
+            ])
+            .status(),
+    );
 }
 
 #[expect(
@@ -2374,6 +2398,55 @@ pub(crate) fn wait_for_overlay_configmap(
     }
 }
 
+/// Expected identity and tool set for an MCP routing-overlay check.
+pub(crate) struct ToolOverlayExpectation<'expected> {
+    /// Candidate cluster expected for every tool.
+    pub(crate) cluster: &'expected str,
+    /// Namespace containing the routing-overlay `ConfigMap`.
+    pub(crate) namespace: &'expected str,
+    /// Candidate site expected for every tool.
+    pub(crate) site: &'expected str,
+    /// Exact tool-name set expected in the overlay.
+    pub(crate) tools: &'expected [&'expected str],
+}
+
+/// Poll until the overlay `ConfigMap` contains the expected MCP candidates.
+///
+/// This is stronger than [`wait_for_overlay_configmap`] which only checks
+/// existence - it retries until the content is correct, handling the race
+/// between `ConfigMap` creation and the first tool-bearing reconcile.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synchronous poll loop in xtask; no async runtime available"
+)]
+pub(crate) fn wait_for_overlay_with_tools(
+    context: &str,
+    network: &str,
+    gateway: &str,
+    expectation: &ToolOverlayExpectation<'_>,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    loop {
+        let verification_error = match read_overlay_configmap(context, network, gateway, expectation.namespace) {
+            Ok(overlay) => match verify_tool_provider_overlay(&overlay, expectation) {
+                Ok(()) => return Ok(()),
+                Err(error) => error.to_string(),
+            },
+            Err(error) => error.to_string(),
+        };
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "timeout waiting for overlay ConfigMap grid-overlay-{network}-{gateway} to contain expected mcp_tool \
+                 candidates; last error: {verification_error}"
+            )
+            .into());
+        }
+        eprintln!("  waiting for overlay with mcp_tool candidates...");
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Overlay verification
 // ---------------------------------------------------------------------------
@@ -2437,6 +2510,58 @@ pub(crate) fn verify_overlay(
         }
     }
     eprintln!("  [OK] overlay: {healthy_cluster} present, {excluded_cluster} absent");
+    Ok(())
+}
+
+/// Verify the overlay contains exactly the expected `mcp_tool` candidates.
+///
+/// Each expected tool must have the configured site and cluster and must be
+/// fresh. Unexpected tools, missing fields, null fields, and stale candidates
+/// are rejected.
+#[expect(
+    clippy::too_many_lines,
+    reason = "field validation and exact tuple comparison form one assertion path"
+)]
+pub(crate) fn verify_tool_provider_overlay(
+    overlay: &serde_json::Value,
+    expectation: &ToolOverlayExpectation<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let candidates = overlay["candidates"]
+        .as_array()
+        .ok_or("overlay missing candidates array")?;
+    let mut found = Vec::new();
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| candidate["kind"].as_str() == Some("mcp_tool"))
+    {
+        let name = candidate["name"]
+            .as_str()
+            .ok_or("mcp_tool candidate missing string field 'name'")?;
+        let site = candidate["site"]
+            .as_str()
+            .ok_or("mcp_tool candidate missing string field 'site'")?;
+        let cluster = candidate["cluster"]
+            .as_str()
+            .ok_or("mcp_tool candidate missing string field 'cluster'")?;
+        let fresh = candidate["fresh"]
+            .as_bool()
+            .ok_or("mcp_tool candidate missing boolean field 'fresh'")?;
+        found.push(("mcp_tool", name, site, cluster, fresh));
+    }
+    if found.is_empty() {
+        return Err("no mcp_tool candidates found in overlay".into());
+    }
+    found.sort_unstable();
+    let mut expected: Vec<(&str, &str, &str, &str, bool)> = expectation
+        .tools
+        .iter()
+        .map(|tool| ("mcp_tool", *tool, expectation.site, expectation.cluster, true))
+        .collect();
+    expected.sort_unstable();
+    if found != expected {
+        return Err(format!("mcp_tool candidates mismatch: expected {expected:?}, got {found:?}").into());
+    }
+    eprintln!("  [OK] overlay contains mcp_tool candidates: {found:?}");
     Ok(())
 }
 
@@ -8036,6 +8161,127 @@ mod tests {
         assert!(
             verify_overlay(&overlay, "healthy", "excluded").is_err(),
             "healthy cluster with fresh=false must fail verification"
+        );
+    }
+
+    #[test]
+    fn verify_tool_provider_overlay_accepts_exact_candidate_tuples() {
+        let tools = ["read_file", "list_directory"];
+        let expectation = ToolOverlayExpectation {
+            cluster: "mcp-server",
+            namespace: "default",
+            site: "site-a",
+            tools: &tools,
+        };
+        let overlay = serde_json::json!({
+            "candidates": [
+                {
+                    "kind": "mcp_tool",
+                    "name": "list_directory",
+                    "site": "site-a",
+                    "cluster": "mcp-server",
+                    "fresh": true
+                },
+                {
+                    "kind": "mcp_tool",
+                    "name": "read_file",
+                    "site": "site-a",
+                    "cluster": "mcp-server",
+                    "fresh": true
+                }
+            ]
+        });
+
+        assert!(
+            verify_tool_provider_overlay(&overlay, &expectation).is_ok(),
+            "exact tool candidate tuples must pass regardless of overlay order"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "table of malformed candidate fixtures covers every routed field"
+    )]
+    fn verify_tool_provider_overlay_rejects_wrong_candidate_fields() {
+        let tools = ["read_file"];
+        let expectation = ToolOverlayExpectation {
+            cluster: "mcp-server",
+            namespace: "default",
+            site: "site-a",
+            tools: &tools,
+        };
+        let invalid_candidates = [
+            serde_json::json!({
+                "kind": "mcp_tool",
+                "name": "read_file",
+                "site": "site-b",
+                "cluster": "mcp-server",
+                "fresh": true
+            }),
+            serde_json::json!({
+                "kind": "mcp_tool",
+                "name": "read_file",
+                "site": "site-a",
+                "cluster": "wrong-cluster",
+                "fresh": true
+            }),
+            serde_json::json!({
+                "kind": "mcp_tool",
+                "name": "read_file",
+                "site": "site-a",
+                "cluster": "mcp-server",
+                "fresh": false
+            }),
+            serde_json::json!({
+                "kind": "mcp_tool",
+                "name": "read_file",
+                "site": "site-a",
+                "cluster": null,
+                "fresh": true
+            }),
+        ];
+
+        for candidate in invalid_candidates {
+            let overlay = serde_json::json!({ "candidates": [candidate] });
+            assert!(
+                verify_tool_provider_overlay(&overlay, &expectation).is_err(),
+                "wrong, stale, or malformed candidate fields must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_tool_provider_overlay_rejects_unexpected_tools() {
+        let tools = ["read_file"];
+        let expectation = ToolOverlayExpectation {
+            cluster: "mcp-server",
+            namespace: "default",
+            site: "site-a",
+            tools: &tools,
+        };
+        let overlay = serde_json::json!({
+            "candidates": [
+                {
+                    "kind": "mcp_tool",
+                    "name": "read_file",
+                    "site": "site-a",
+                    "cluster": "mcp-server",
+                    "fresh": true
+                },
+                {
+                    "kind": "mcp_tool",
+                    "name": "delete_file",
+                    "site": "site-a",
+                    "cluster": "mcp-server",
+                    "fresh": true
+                }
+            ]
+        });
+
+        assert!(
+            verify_tool_provider_overlay(&overlay, &expectation).is_err(),
+            "unexpected MCP tools must fail exact-set verification"
         );
     }
 

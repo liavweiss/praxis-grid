@@ -163,17 +163,15 @@ pub(crate) fn default_stable_id(kind: CapabilityKind, name: &str, site: &str, cl
 ///
 /// # Errors
 ///
-/// Returns [`FilterError`] if the list is empty or exceeds [`MAX_CANDIDATES`],
-/// any name/site/cluster field is blank or oversized, or a duplicate
+/// An empty list is a valid authoritative no-route snapshot. Returns
+/// [`FilterError`] if the list exceeds [`MAX_CANDIDATES`], any
+/// name/site/cluster field is blank or oversized, or a duplicate
 /// (kind, name, site, cluster) tuple exists.
 #[expect(
     clippy::too_many_lines,
     reason = "single validation loop, splitting hurts readability"
 )]
 pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<RouteCandidate>, FilterError> {
-    if raw.is_empty() {
-        return Err("grid: candidates list must not be empty".into());
-    }
     if raw.len() > MAX_CANDIDATES {
         return Err(format!("grid: candidates exceeds maximum of {MAX_CANDIDATES}").into());
     }
@@ -324,9 +322,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_candidates_rejected() {
-        let err = validate_candidates(vec![]).expect_err("should fail");
-        assert!(err.to_string().contains("must not be empty"), "{err}");
+    fn empty_candidates_are_an_authoritative_no_route_snapshot() {
+        let candidates = validate_candidates(vec![]).unwrap_or_else(|_| std::process::abort());
+        assert!(candidates.is_empty());
     }
 
     #[test]
