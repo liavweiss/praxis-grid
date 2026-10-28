@@ -26,19 +26,19 @@ const MAX_CARD_URL_LENGTH: usize = 2048;
 /// Maximum relative path length accepted for Agent Card discovery.
 const MAX_CARD_PATH_LENGTH: usize = 512;
 /// Maximum number of skills retained in configuration or status.
-const MAX_SKILLS: usize = 128;
+pub(crate) const MAX_SKILLS: usize = 128;
 /// Maximum length of an Agent Card skill ID.
-const MAX_SKILL_ID_LENGTH: usize = 128;
+pub(crate) const MAX_SKILL_ID_LENGTH: usize = 128;
 /// Maximum length of an Agent Card display name.
-const MAX_SKILL_NAME_LENGTH: usize = 128;
+pub(crate) const MAX_SKILL_NAME_LENGTH: usize = 128;
 /// Maximum number of input or output modes retained per skill.
-const MAX_MODE_COUNT: usize = 8;
+pub(crate) const MAX_MODE_COUNT: usize = 8;
 /// Maximum length of an input or output mode.
-const MAX_MODE_LENGTH: usize = 128;
+pub(crate) const MAX_MODE_LENGTH: usize = 128;
 /// Maximum number of protocol interfaces retained in status.
-const MAX_INTERFACES: usize = 8;
+pub(crate) const MAX_INTERFACES: usize = 8;
 /// Maximum length of an advertised version string.
-const MAX_VERSION_LENGTH: usize = 128;
+pub(crate) const MAX_VERSION_LENGTH: usize = 128;
 /// Maximum number of site names retained in status.
 const MAX_MATCHING_SITES: usize = 256;
 /// Maximum length of a `GridSite` name retained in status.
@@ -96,7 +96,7 @@ pub struct AgentToAgentProviderSpec {
     /// never trusted to replace the configured endpoint.
     ///
     /// Discovery follows no redirects and rejects loopback, link-local,
-    /// unspecified, unique-local, and cloud-metadata addresses using the
+    /// unspecified and cloud-metadata addresses using the
     /// `AgentToolProvider` probe's SSRF policy. Authentication and TLS client
     /// identity are sent only to the HTTPS origin of `spec.endpoint`; an
     /// explicit URL on another origin is fetched without those credentials.
@@ -159,7 +159,7 @@ pub struct AgentToAgentProviderSpec {
 /// `https://agent.example/.well-known/agent-card.json`.
 ///
 /// Discovery follows no redirects and rejects loopback, link-local,
-/// unspecified, unique-local, and cloud-metadata addresses using the same
+/// unspecified and cloud-metadata addresses using the same
 /// SSRF policy as the `AgentToolProvider` probe. Authentication and TLS client
 /// identity are sent only to the HTTPS origin of `spec.endpoint`; an explicit
 /// URL on another origin is fetched without those credentials. A discovered
@@ -366,8 +366,10 @@ pub struct AgentToAgentProviderStatus {
     /// `CredentialSecretMissing`, `CredentialSecretKeyMissing`,
     /// `CredentialSecretValueInvalid`, `EndpointTlsSecretMissing`,
     /// `EndpointTlsKeyMissing`, `EndpointTlsMaterialInvalid`,
-    /// `AgentCardUnreachable`, `AgentCardInvalid`,
-    /// `AgentCardUnsupportedBinding`, and `AgentCardNoRoutableSkills`.
+    /// `EndpointTlsIdentityMismatch`, `A2aAuthRejected`,
+    /// `A2aAuthTokenInvalid`, `AgentCardUnreachable`, `AgentCardInvalid`,
+    /// `AgentCardUnsupportedBinding`, `AgentCardEndpointMismatch`, and
+    /// `AgentCardNoRoutableSkills`.
     #[schemars(length(max = 128), regex(pattern = r"^.*\S.*$"))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,

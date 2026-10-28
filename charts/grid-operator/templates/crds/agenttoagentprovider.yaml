@@ -69,7 +69,7 @@ spec:
                     never trusted to replace the configured endpoint.
 
                     Discovery follows no redirects and rejects loopback, link-local,
-                    unspecified, unique-local, and cloud-metadata addresses using the
+                    unspecified and cloud-metadata addresses using the
                     `AgentToolProvider` probe's SSRF policy. Authentication and TLS client
                     identity are sent only to the HTTPS origin of `spec.endpoint`; an
                     explicit URL on another origin is fetched without those credentials.
@@ -790,8 +790,10 @@ spec:
                     `CredentialSecretMissing`, `CredentialSecretKeyMissing`,
                     `CredentialSecretValueInvalid`, `EndpointTlsSecretMissing`,
                     `EndpointTlsKeyMissing`, `EndpointTlsMaterialInvalid`,
-                    `AgentCardUnreachable`, `AgentCardInvalid`,
-                    `AgentCardUnsupportedBinding`, and `AgentCardNoRoutableSkills`.
+                    `EndpointTlsIdentityMismatch`, `A2aAuthRejected`,
+                    `A2aAuthTokenInvalid`, `AgentCardUnreachable`, `AgentCardInvalid`,
+                    `AgentCardUnsupportedBinding`, `AgentCardEndpointMismatch`, and
+                    `AgentCardNoRoutableSkills`.
                   maxLength: 128
                   nullable: true
                   pattern: ^.*\S.*$

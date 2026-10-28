@@ -1510,8 +1510,8 @@ This API is experimental and is disabled from the default Grid build and
 installation. Enable the operator `a2a` Cargo feature, which activates the
 `experimental` marker, and the chart value `experimental.a2a.enabled=true`
 before installing or using this CRD.
-The current contract is API-only; Agent Card discovery and routing are
-follow-up tasks.
+The feature-enabled controller discovers and validates Agent Cards. Distribution
+and routing remain follow-up tasks.
 
 ```yaml
 apiVersion: grid.praxis.fast/v1alpha1
@@ -1551,7 +1551,7 @@ an endpoint path. For example, an endpoint of
 `https://agent.example/.well-known/agent-card.json`.
 
 Set at most one of `agentCard.url` and `agentCard.path`. Discovery follows no
-redirects and rejects loopback, link-local, unspecified, unique-local, and
+redirects and rejects loopback, link-local, unspecified, and
 cloud-metadata addresses using the same SSRF policy as the AgentToolProvider
 probe. Authentication and TLS client identity are sent only to the HTTPS
 origin of `spec.endpoint`; an explicit card URL on another origin is fetched
@@ -1559,7 +1559,16 @@ without those credentials. A discovered card never changes the configured
 endpoint used for the private agent hop. `skillAllowlist` is empty by default
 and identifies skills by the Agent Card `id`, not by display name.
 
-**Phases**: Pending → Available → Degraded → Unavailable
+**Phases**: Pending → Available or Unavailable. The controller does not
+currently produce `Degraded`.
+
+The controller performs discovery only after at least one site matches. It
+uses one outer 10-second budget for DNS resolution, Secret reads, TLS setup,
+and the response, never follows redirects, and accepts at most 512 KiB. Agent
+Card discovery is the health operation; the operator never sends a
+side-effecting A2A message. Failed refreshes retain the previous bounded card
+for diagnostics while changing the current generation to `Unavailable`, so
+the retained data cannot remain routable.
 
 `status.discoveredCard` is deliberately bounded. It contains the observed
 agent name/version, card-level default input/output modes,
@@ -1586,7 +1595,11 @@ maximum-size serialization test keep the complete status below 512 KiB.
 | `EndpointTlsSecretMissing` | Unavailable | A referenced TLS Secret does not exist. |
 | `EndpointTlsKeyMissing` | Unavailable | A referenced TLS key is absent or empty. |
 | `EndpointTlsMaterialInvalid` | Unavailable | CA or client certificate material cannot be parsed. |
+| `EndpointTlsIdentityMismatch` | Unavailable | The client certificate and private key cannot form an mTLS identity. |
+| `A2aAuthRejected` | Unavailable | Agent Card discovery returned HTTP 401 or 403. |
+| `A2aAuthTokenInvalid` | Unavailable | The resolved bearer token cannot be encoded safely as an HTTP header. |
 | `AgentCardUnreachable` | Unavailable | Card discovery failed due to transport, DNS, timeout, or policy rejection. |
 | `AgentCardInvalid` | Unavailable | The response is not a bounded, valid A2A Agent Card. |
 | `AgentCardUnsupportedBinding` | Unavailable | The card does not expose the configured JSON-RPC binding. |
+| `AgentCardEndpointMismatch` | Unavailable | A supported card interface uses a different authority than `spec.endpoint`. |
 | `AgentCardNoRoutableSkills` | Unavailable | No discovered skill remains after validation and the configured allowlist. |

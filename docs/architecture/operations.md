@@ -107,9 +107,10 @@ The standalone install creates:
 | `Deployment` | `grid-operator` | `grid-system` |
 
 The operator runs as a single binary with controllers for reconciled CRD types
-in the same process. `AgentToAgentProvider` is an experimental API-only
-contract, disabled from the default build and install; its controller is
-introduced by a follow-up task. No SWIM runtime starts until a `GridNetwork`
+in the same process. `AgentToAgentProvider` and its discovery controller are
+experimental and disabled from the default build and install. The dedicated
+`a2a` Cargo feature compiles and registers that controller; the matching Helm
+profile installs its CRD and RBAC. No SWIM runtime starts until a `GridNetwork`
 resource exists.
 
 **Important**: AGN deploys only the operator and CRDs. Cluster lifecycle,

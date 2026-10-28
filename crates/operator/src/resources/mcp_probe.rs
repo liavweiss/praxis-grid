@@ -34,21 +34,10 @@ use crate::{
     crd::inference_provider::EndpointTlsConfig,
     resources::{
         credentials::BearerToken,
-        endpoint_resolution::{self, ResolvedEndpoint},
-        endpoint_tls::{read_secret_bytes_for_tls, secret_ref_from_client_cert},
-        tls_backend::{validate_pem_certificates, validate_pem_private_key},
+        endpoint_http_client::{self, EndpointHttpClientError},
+        endpoint_resolution,
     },
 };
-
-/// Stable `status.reason` for any of `attach_tls_client_identity`'s three
-/// client-identity failure modes (unparseable cert, unparseable key, or a
-/// cert/key pair `reqwest::Identity` itself refuses to build from).
-///
-/// A single shared reason rather than three variants: none of the three are
-/// distinguishable in a way that would change what an operator does next
-/// (fix the referenced client certificate/key Secret), so splitting them
-/// would add `status.reason` cardinality without adding diagnostic value.
-const ENDPOINT_TLS_IDENTITY_MISMATCH: &str = "EndpointTlsIdentityMismatch";
 
 /// Maximum number of tool names persisted to `status.discoveredTools` from
 /// a single probe.
@@ -234,17 +223,6 @@ pub(crate) fn classify_list_tools_failure(status: Option<u16>) -> McpProbeOutcom
     }
 }
 
-/// Whether the probe should build a custom TLS-configured client rather
-/// than using native root certificates.
-///
-/// Trivial in isolation, but named and tested like the rest of this
-/// module's business rules per the project's decision-logic-first testing
-/// convention: `spec.tls` presence is the single source of truth for this
-/// choice, so this function's name is deliberately the whole rule.
-pub(crate) fn should_use_custom_tls(tls_config: Option<&EndpointTlsConfig>) -> bool {
-    tls_config.is_some()
-}
-
 /// Build the outbound `Authorization` header for the probe request.
 ///
 /// Returns an empty map when `token` is `None` (`spec.auth` absent, manual,
@@ -332,200 +310,12 @@ pub(crate) fn observed_status_from_service_error(error: &rmcp::ServiceError) -> 
 // Live probe orchestration (I/O; covered by the integration/E2E tiers)
 // ---------------------------------------------------------------------------
 
-/// Resolve `endpoint`'s host, applying the DNS-resolved-address half of the
-/// SSRF check (the literal-IP half already ran in [`validate_probe_url`]).
-///
-/// Fails closed: DNS resolution failure, timeout, or any resolved address
-/// being SSRF-sensitive returns [`McpProbeOutcome::Unreachable`].
-async fn resolve_endpoint_for_probe(endpoint: &str, timeout: Duration) -> Result<ResolvedEndpoint, McpProbeOutcome> {
-    let uri: http::Uri = endpoint.parse().map_err(|_parse_err| McpProbeOutcome::Unreachable)?;
-    endpoint_resolution::resolve_endpoint(&uri, timeout)
-        .await
-        .map_err(|_resolution_error| McpProbeOutcome::Unreachable)
-}
-
-/// Build the `reqwest::Client` used for the probe: address-pinned per
-/// [`resolve_endpoint_for_probe`], and carrying `spec.tls`'s CA/client
-/// identity material when configured.
-///
-/// # Errors
-///
-/// Returns [`McpProbeOutcome::TlsConfigInvalid`] if `tls_config` is `Some`
-/// but its referenced Secret material cannot be resolved into a usable
-/// certificate/identity, or [`McpProbeOutcome::Unreachable`] if the
-/// underlying `reqwest::Client` fails to build.
-async fn build_probe_client(
-    kube_client: &kube::Client,
-    tls_config: Option<&EndpointTlsConfig>,
-    provider_identity: &str,
-    resolved: &ResolvedEndpoint,
-) -> Result<reqwest::Client, McpProbeOutcome> {
-    let mut builder = reqwest::Client::builder()
-        .pool_max_idle_per_host(0)
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none());
-
-    if let Some(hostname) = resolved.hostname() {
-        builder = builder.resolve_to_addrs(hostname, resolved.addrs());
+/// Convert a shared HTTP-client construction failure into the MCP outcome.
+fn map_http_client_error(error: EndpointHttpClientError) -> McpProbeOutcome {
+    match error {
+        EndpointHttpClientError::Unreachable => McpProbeOutcome::Unreachable,
+        EndpointHttpClientError::TlsConfigInvalid(reason) => McpProbeOutcome::TlsConfigInvalid(reason),
     }
-
-    if should_use_custom_tls(tls_config) {
-        let tls = tls_config.unwrap_or_else(|| std::process::abort());
-        builder = attach_tls_material(builder, kube_client, tls, provider_identity).await?;
-    }
-
-    builder.build().map_err(|_build_err| McpProbeOutcome::Unreachable)
-}
-
-/// Read `tls`'s referenced Secret material and attach it to `builder` as a
-/// root CA and, when configured, a client identity.
-///
-/// Delegates to [`attach_tls_ca`] and [`attach_tls_client_identity`], split
-/// out purely to keep each function within the project's complexity/line
-/// lints; the CA and client-identity halves have no shared state beyond
-/// the builder itself.
-async fn attach_tls_material(
-    builder: reqwest::ClientBuilder,
-    kube_client: &kube::Client,
-    tls: &EndpointTlsConfig,
-    provider_identity: &str,
-) -> Result<reqwest::ClientBuilder, McpProbeOutcome> {
-    let builder = Box::pin(attach_tls_ca(builder, kube_client, tls, provider_identity)).await?;
-    let Some(client_ref) = &tls.client_certificate_secret_ref else {
-        return Ok(builder);
-    };
-    Box::pin(attach_tls_client_identity(
-        builder,
-        kube_client,
-        client_ref,
-        provider_identity,
-    ))
-    .await
-}
-
-/// Read one piece of TLS material (CA cert, client cert, or client key)
-/// from a Secret, mapping a resolution failure to the stable
-/// `EndpointTls*` `status.reason` family.
-///
-/// Shared by [`attach_tls_ca`] and [`attach_tls_client_identity`] so the
-/// Secret-read-plus-reason-mapping logic exists exactly once rather than
-/// once per material kind.
-async fn read_tls_material(
-    kube_client: &kube::Client,
-    secret_ref: &crate::crd::grid_network::SecretRef,
-    key_name: &str,
-    provider_identity: &str,
-    material_desc: &str,
-) -> Result<Vec<u8>, McpProbeOutcome> {
-    read_secret_bytes_for_tls(kube_client, secret_ref, key_name, provider_identity, material_desc)
-        .await
-        .map_err(|(reason, msg)| {
-            tracing::warn!(provider_identity, error = %msg, material_desc, "AgentToolProvider probe TLS material invalid");
-            McpProbeOutcome::TlsConfigInvalid(reason.as_status_reason("Endpoint"))
-        })
-}
-
-/// Read `tls`'s CA certificate and add it to `builder` as a trusted root.
-async fn attach_tls_ca(
-    builder: reqwest::ClientBuilder,
-    kube_client: &kube::Client,
-    tls: &EndpointTlsConfig,
-    provider_identity: &str,
-) -> Result<reqwest::ClientBuilder, McpProbeOutcome> {
-    let ca_pem = Box::pin(crate::resources::endpoint_tls::read_ca_for_tls(
-        kube_client,
-        tls,
-        provider_identity,
-    ))
-    .await
-    .map_err(|(reason, msg)| {
-        tracing::warn!(provider_identity, error = %msg, "AgentToolProvider probe TLS material invalid");
-        McpProbeOutcome::TlsConfigInvalid(reason.as_status_reason("Endpoint"))
-    })?;
-    if let Err(e) = validate_pem_certificates(&ca_pem) {
-        tracing::warn!(provider_identity, error = %e, "AgentToolProvider probe CA PEM unparseable");
-        return Err(McpProbeOutcome::TlsConfigInvalid(
-            "EndpointTlsMaterialInvalid".to_owned(),
-        ));
-    }
-    // `reqwest::Certificate::from_pem` itself no longer needs to be a
-    // validation gate (`validate_pem_certificates` above already is),
-    // but building the actual `Certificate` reqwest will use is still
-    // required, and kept as defense-in-depth should a future reqwest
-    // version regain stricter parsing of its own.
-    let ca_cert = reqwest::Certificate::from_pem(&ca_pem).map_err(|e| {
-        tracing::warn!(provider_identity, error = %e, "AgentToolProvider probe CA PEM unparseable");
-        McpProbeOutcome::TlsConfigInvalid("EndpointTlsMaterialInvalid".to_owned())
-    })?;
-    // `tls_certs_only` (not `add_root_certificate`, which merges this CA
-    // into reqwest's platform trust store) so a publicly trusted
-    // certificate cannot satisfy a probe explicitly configured to trust
-    // only this private CA -- `spec.tls.caSecretRef` documents the
-    // supplied CA as the endpoint's only trusted root.
-    Ok(builder.tls_certs_only([ca_cert]))
-}
-
-/// Build the probe client identity: rustls takes one concatenated PEM, native-tls (fips) takes cert and key separately.
-#[cfg(not(feature = "fips"))]
-fn build_probe_client_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<reqwest::Identity, reqwest::Error> {
-    let mut combined = Vec::with_capacity(cert_pem.len() + key_pem.len());
-    combined.extend_from_slice(cert_pem);
-    combined.extend_from_slice(key_pem);
-    reqwest::Identity::from_pem(&combined)
-}
-
-/// Build the probe client identity: rustls takes one concatenated PEM, native-tls (fips) takes cert and key separately.
-#[cfg(feature = "fips")]
-fn build_probe_client_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<reqwest::Identity, reqwest::Error> {
-    reqwest::Identity::from_pkcs8_pem(cert_pem, key_pem)
-}
-
-/// Read `client_ref`'s certificate and private key and attach them to
-/// `builder` as the mTLS client identity.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential cert and key reads, then eager PEM validation of each"
-)]
-async fn attach_tls_client_identity(
-    builder: reqwest::ClientBuilder,
-    kube_client: &kube::Client,
-    client_ref: &crate::crd::inference_provider::ClientCertificateSecretRef,
-    provider_identity: &str,
-) -> Result<reqwest::ClientBuilder, McpProbeOutcome> {
-    let cert_ref = secret_ref_from_client_cert(client_ref);
-    let identity_pem = Box::pin(read_tls_material(
-        kube_client,
-        &cert_ref,
-        &client_ref.certificate_key,
-        provider_identity,
-        "client cert",
-    ))
-    .await?;
-    let key_pem = Box::pin(read_tls_material(
-        kube_client,
-        &cert_ref,
-        &client_ref.private_key_key,
-        provider_identity,
-        "client key",
-    ))
-    .await?;
-    if let Err(e) = validate_pem_certificates(&identity_pem) {
-        tracing::warn!(provider_identity, error = %e, "AgentToolProvider probe client certificate unparseable");
-        return Err(McpProbeOutcome::TlsConfigInvalid(
-            ENDPOINT_TLS_IDENTITY_MISMATCH.to_owned(),
-        ));
-    }
-    if let Err(e) = validate_pem_private_key(&key_pem) {
-        tracing::warn!(provider_identity, error = %e, "AgentToolProvider probe client key unparseable");
-        return Err(McpProbeOutcome::TlsConfigInvalid(
-            ENDPOINT_TLS_IDENTITY_MISMATCH.to_owned(),
-        ));
-    }
-    let identity = build_probe_client_identity(&identity_pem, &key_pem).map_err(|e| {
-        tracing::warn!(provider_identity, error = %e, "AgentToolProvider probe client identity unparseable");
-        McpProbeOutcome::TlsConfigInvalid(ENDPOINT_TLS_IDENTITY_MISMATCH.to_owned())
-    })?;
-    Ok(builder.identity(identity))
 }
 
 /// Parameters for a single live MCP probe attempt.
@@ -599,14 +389,17 @@ async fn probe_agent_tool_provider_unbounded(kube_client: &kube::Client, request
         return McpProbeOutcome::Unreachable;
     }
 
-    let resolved = match resolve_endpoint_for_probe(request.endpoint, request.timeout).await {
-        Ok(resolved) => resolved,
-        Err(outcome) => return outcome,
-    };
-
-    let client = match build_probe_client(kube_client, request.tls_config, request.provider_identity, &resolved).await {
+    let client = match build_probe_http_client(
+        kube_client,
+        request.endpoint,
+        request.timeout,
+        request.tls_config,
+        request.provider_identity,
+    )
+    .await
+    {
         Ok(client) => client,
-        Err(outcome) => return outcome,
+        Err(error) => return map_http_client_error(error),
     };
 
     Box::pin(run_probe_session(
@@ -616,6 +409,23 @@ async fn probe_agent_tool_provider_unbounded(kube_client: &kube::Client, request
         request.auth_token,
     ))
     .await
+}
+
+/// Resolve, pin, and build the shared HTTP client used by the MCP session.
+async fn build_probe_http_client(
+    kube_client: &kube::Client,
+    endpoint: &str,
+    timeout: Duration,
+    tls_config: Option<&EndpointTlsConfig>,
+    provider_identity: &str,
+) -> Result<reqwest::Client, EndpointHttpClientError> {
+    let uri: http::Uri = endpoint
+        .parse()
+        .map_err(|_parse_error| EndpointHttpClientError::Unreachable)?;
+    let resolved = endpoint_resolution::resolve_endpoint(&uri, timeout)
+        .await
+        .map_err(|_resolution_error| EndpointHttpClientError::Unreachable)?;
+    endpoint_http_client::build_endpoint_client(kube_client, tls_config, provider_identity, &resolved).await
 }
 
 /// Connect to the MCP server over Streamable HTTP and call `tools/list`,
@@ -666,7 +476,16 @@ mod tests {
     use std::net::SocketAddr;
 
     use super::*;
-    use crate::crd::inference_provider::ProviderPhase;
+    use crate::{
+        crd::inference_provider::ProviderPhase,
+        resources::{
+            endpoint_http_client::{
+                ENDPOINT_TLS_IDENTITY_MISMATCH, attach_tls_ca, attach_tls_client_identity, attach_tls_material,
+                read_tls_material,
+            },
+            tls_backend::{validate_pem_certificates, validate_pem_private_key},
+        },
+    };
 
     // -----------------------------------------------------------------------
     // phase_and_reason_from_probe
@@ -912,35 +731,6 @@ mod tests {
             classify_list_tools_failure(None),
             McpProbeOutcome::InvalidResponse,
             "a protocol/deserialize failure with no HTTP status is still a response problem post-connect"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // should_use_custom_tls
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn absent_spec_tls_does_not_use_custom_tls() {
-        assert!(
-            !should_use_custom_tls(None),
-            "absent spec.tls must use native root certificates"
-        );
-    }
-
-    #[test]
-    fn present_spec_tls_uses_custom_tls() {
-        let tls = EndpointTlsConfig {
-            ca_secret_ref: Some(crate::crd::grid_network::SecretRef {
-                name: "ca".to_owned(),
-                namespace: "ns".to_owned(),
-                key: None,
-            }),
-            ca_config_map_ref: None,
-            client_certificate_secret_ref: None,
-        };
-        assert!(
-            should_use_custom_tls(Some(&tls)),
-            "present spec.tls must trigger the custom TLS path"
         );
     }
 
@@ -1401,7 +1191,9 @@ mod tests {
         let result = read_tls_material(&client, &test_secret_ref("absent"), "ca.crt", "test-provider", "CA").await;
         assert_eq!(
             result,
-            Err(McpProbeOutcome::TlsConfigInvalid("EndpointTlsSecretMissing".to_owned())),
+            Err(EndpointHttpClientError::TlsConfigInvalid(
+                "EndpointTlsSecretMissing".to_owned()
+            )),
             "a missing Secret must surface as EndpointTlsSecretMissing"
         );
     }
@@ -1423,7 +1215,9 @@ mod tests {
         let result = read_tls_material(&client, &test_secret_ref("ca-secret"), "ca.crt", "test-provider", "CA").await;
         assert_eq!(
             result,
-            Err(McpProbeOutcome::TlsConfigInvalid("EndpointTlsKeyMissing".to_owned())),
+            Err(EndpointHttpClientError::TlsConfigInvalid(
+                "EndpointTlsKeyMissing".to_owned()
+            )),
             "a key absent from an existing Secret's data must surface as EndpointTlsKeyMissing, \
              not EndpointTlsSecretMissing (grid#58)"
         );
@@ -1435,7 +1229,9 @@ mod tests {
         let result = read_tls_material(&client, &test_secret_ref("ca-secret"), "ca.crt", "test-provider", "CA").await;
         assert_eq!(
             result,
-            Err(McpProbeOutcome::TlsConfigInvalid("EndpointTlsKeyMissing".to_owned())),
+            Err(EndpointHttpClientError::TlsConfigInvalid(
+                "EndpointTlsKeyMissing".to_owned()
+            )),
             "a key present in Secret.data with an empty value must also surface as EndpointTlsKeyMissing, \
              the same as a key absent entirely (grid#58)"
         );
@@ -1481,7 +1277,7 @@ mod tests {
         let result = attach_tls_ca(reqwest::Client::builder(), &client, &tls, "test-provider").await;
         assert_eq!(
             result.unwrap_err(),
-            McpProbeOutcome::TlsConfigInvalid("EndpointTlsMaterialInvalid".to_owned()),
+            EndpointHttpClientError::TlsConfigInvalid("EndpointTlsMaterialInvalid".to_owned()),
             "unparseable CA PEM must surface as EndpointTlsMaterialInvalid"
         );
     }
@@ -1502,7 +1298,7 @@ mod tests {
         // easy to accidentally invert.
         assert_eq!(
             result.unwrap_err(),
-            McpProbeOutcome::TlsConfigInvalid("EndpointTlsKeyMissing".to_owned()),
+            EndpointHttpClientError::TlsConfigInvalid("EndpointTlsKeyMissing".to_owned()),
             "an empty CA Secret value is caught by read_tls_material before PEM validation runs"
         );
     }
@@ -1519,7 +1315,7 @@ mod tests {
         let result = attach_tls_ca(reqwest::Client::builder(), &client, &tls, "test-provider").await;
         assert_eq!(
             result.unwrap_err(),
-            McpProbeOutcome::TlsConfigInvalid("EndpointTlsSecretMissing".to_owned()),
+            EndpointHttpClientError::TlsConfigInvalid("EndpointTlsSecretMissing".to_owned()),
             "attach_tls_ca must propagate read_tls_material's Secret-missing reason unchanged"
         );
     }
@@ -1580,7 +1376,7 @@ mod tests {
             attach_tls_client_identity(reqwest::Client::builder(), &client, &client_ref, "test-provider").await;
         assert_eq!(
             result.unwrap_err(),
-            McpProbeOutcome::TlsConfigInvalid(ENDPOINT_TLS_IDENTITY_MISMATCH.to_owned()),
+            EndpointHttpClientError::TlsConfigInvalid(ENDPOINT_TLS_IDENTITY_MISMATCH.to_owned()),
             "unparseable key material must surface as EndpointTlsIdentityMismatch"
         );
     }
@@ -1656,7 +1452,7 @@ mod tests {
         let result = attach_tls_material(reqwest::Client::builder(), &kube_client, &tls, "test-provider").await;
         assert_eq!(
             result.unwrap_err(),
-            McpProbeOutcome::TlsConfigInvalid("EndpointTlsSecretMissing".to_owned()),
+            EndpointHttpClientError::TlsConfigInvalid("EndpointTlsSecretMissing".to_owned()),
             "a missing client-cert Secret must fail the whole attach_tls_material call, not be silently skipped"
         );
     }
@@ -1684,9 +1480,8 @@ mod integration_tests {
         },
     };
 
-    use super::{
-        BearerToken, McpProbeOutcome, ProbeRequest, build_probe_client, resolve_endpoint_for_probe, run_probe_session,
-    };
+    use super::{BearerToken, McpProbeOutcome, ProbeRequest, map_http_client_error, run_probe_session};
+    use crate::resources::{endpoint_http_client, endpoint_resolution};
 
     /// Runs the same resolve → build-client → session pipeline as
     /// [`super::probe_agent_tool_provider`], skipping only its
@@ -1711,15 +1506,25 @@ mod integration_tests {
         #[cfg(not(feature = "fips"))]
         drop(rustls::crypto::ring::default_provider().install_default());
 
-        let resolved = match resolve_endpoint_for_probe(request.endpoint, request.timeout).await {
-            Ok(resolved) => resolved,
-            Err(outcome) => return outcome,
+        let uri: http::Uri = match request.endpoint.parse() {
+            Ok(uri) => uri,
+            Err(_parse_error) => return McpProbeOutcome::Unreachable,
         };
-        let client =
-            match build_probe_client(kube_client, request.tls_config, request.provider_identity, &resolved).await {
-                Ok(client) => client,
-                Err(outcome) => return outcome,
-            };
+        let resolved = match endpoint_resolution::resolve_endpoint_for_test(&uri, request.timeout).await {
+            Ok(resolved) => resolved,
+            Err(_resolution_error) => return McpProbeOutcome::Unreachable,
+        };
+        let client = match endpoint_http_client::build_endpoint_client(
+            kube_client,
+            request.tls_config,
+            request.provider_identity,
+            &resolved,
+        )
+        .await
+        {
+            Ok(client) => client,
+            Err(error) => return map_http_client_error(error),
+        };
         run_probe_session(client, request.endpoint, request.timeout, request.auth_token).await
     }
 

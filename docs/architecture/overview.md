@@ -238,16 +238,17 @@ model-oriented and projects only `inference_model` candidates. A deployment
 that executes MCP calls must provide a dedicated MCP-capable pipeline and a
 reachable load-balancer cluster for every tool candidate.
 
-`AgentToAgentProvider` is the experimental API contract for A2A. It is disabled
-from the default operator build and installation. The resource is
-intentionally limited to configuration and bounded status in this phase; its
-controller, SWIM/CRDT distribution, `a2a_skill` overlay candidates, and A2A
-data-plane route are follow-up tasks. The configured endpoint remains the
-authority even when a discovered Agent Card contains interface URLs.
+`AgentToAgentProvider` is the experimental API and discovery controller for
+A2A. It is disabled from the default operator build and installation. With the
+dedicated `a2a` feature, the controller resolves placement and credentials,
+performs a bounded Agent Card GET, and publishes the validated status subset.
+SWIM/CRDT distribution, `a2a_skill` overlay candidates, and the A2A data-plane
+route remain follow-up tasks. The configured endpoint remains the authority
+even when a discovered Agent Card contains interface URLs.
 
 The resource uses JSON-RPC over HTTP(S) as its initial binding. Its optional
 card configuration can select a safe discovery URL or path and an allowlist of
-Agent Card skill IDs. A future controller stores only a bounded card subset in
+Agent Card skill IDs. The controller stores only a bounded card subset in
 status: name/version, supported binding metadata, streaming capability, and
 skill IDs with input/output modes. Authentication and TLS references are
 resolved by the operator; secret values never enter status or mesh state.

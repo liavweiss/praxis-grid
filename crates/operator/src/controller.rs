@@ -5,6 +5,12 @@
 /// [`AgentToolProvider`]: crate::crd::agent_tool_provider::AgentToolProvider
 pub mod agent_tool_provider;
 
+/// Experimental [`AgentToAgentProvider`] controller.
+///
+/// [`AgentToAgentProvider`]: crate::crd::agent_to_agent_provider::AgentToAgentProvider
+#[cfg(feature = "a2a")]
+pub mod agent_to_agent_provider;
+
 /// [`GridNetwork`] controller.
 ///
 /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork

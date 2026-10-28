@@ -37,6 +37,15 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(MCP_PROBE_DURATION.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    #[cfg(feature = "a2a")]
+    r.register(Box::new(AGENT_TO_AGENT_PROVIDER_PHASE_TRANSITIONS.clone()))
+        .unwrap_or_else(|_| std::process::abort());
+    #[cfg(feature = "a2a")]
+    r.register(Box::new(A2A_AGENT_CARD_PROBE_TOTAL.clone()))
+        .unwrap_or_else(|_| std::process::abort());
+    #[cfg(feature = "a2a")]
+    r.register(Box::new(A2A_AGENT_CARD_PROBE_DURATION.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PEER_POLL_TOTAL.clone()))
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PEER_POLL_RETRIES.clone()))
@@ -824,6 +833,42 @@ static MCP_PROBE_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
     .unwrap_or_else(|_| std::process::abort())
 });
 
+/// Experimental `AgentToAgentProvider` phase transitions.
+#[cfg(feature = "a2a")]
+static AGENT_TO_AGENT_PROVIDER_PHASE_TRANSITIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "grid_agent_to_agent_provider_phase_transition_total",
+            "AgentToAgentProvider phase transitions",
+        ),
+        &["from_phase", "to_phase", "reason"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// Experimental Agent Card discovery attempts by bounded outcome.
+#[cfg(feature = "a2a")]
+static A2A_AGENT_CARD_PROBE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "grid_a2a_agent_card_probe_total",
+            "Total AgentToAgentProvider Agent Card discovery attempts",
+        ),
+        &["outcome"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// Experimental Agent Card discovery duration in seconds.
+#[cfg(feature = "a2a")]
+static A2A_AGENT_CARD_PROBE_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
+    Histogram::with_opts(HistogramOpts::new(
+        "grid_a2a_agent_card_probe_duration_seconds",
+        "AgentToAgentProvider Agent Card discovery duration",
+    ))
+    .unwrap_or_else(|_| std::process::abort())
+});
+
 /// Served-model discovery polls by provider and outcome.
 static MODEL_DISCOVERY_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
@@ -909,6 +954,21 @@ pub(crate) fn record_agent_tool_provider_phase_transition(from: &str, to: &str, 
 pub(crate) fn record_mcp_probe(outcome: &str, duration: Duration) {
     MCP_PROBE_TOTAL.with_label_values(&[outcome]).inc();
     MCP_PROBE_DURATION.observe(duration.as_secs_f64());
+}
+
+/// Record an experimental `AgentToAgentProvider` phase transition.
+#[cfg(feature = "a2a")]
+pub(crate) fn record_agent_to_agent_provider_phase_transition(from: &str, to: &str, reason: &str) {
+    AGENT_TO_AGENT_PROVIDER_PHASE_TRANSITIONS
+        .with_label_values(&[from, to, reason])
+        .inc();
+}
+
+/// Record one completed experimental Agent Card discovery attempt.
+#[cfg(feature = "a2a")]
+pub(crate) fn record_a2a_agent_card_probe(outcome: &str, duration: Duration) {
+    A2A_AGENT_CARD_PROBE_TOTAL.with_label_values(&[outcome]).inc();
+    A2A_AGENT_CARD_PROBE_DURATION.observe(duration.as_secs_f64());
 }
 
 /// Record a successful served-model discovery poll.
@@ -1492,6 +1552,26 @@ mod tests {
         assert!(
             text.contains("grid_mcp_probe_duration_seconds"),
             "output should contain mcp probe duration histogram"
+        );
+    }
+
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn record_a2a_metrics_are_exported() {
+        record_agent_to_agent_provider_phase_transition("Pending", "Available", "AgentCardDiscovered");
+        record_a2a_agent_card_probe("Success", Duration::from_millis(9));
+        let text = String::from_utf8(encode_metrics()).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            text.contains("grid_agent_to_agent_provider_phase_transition_total"),
+            "A2A phase transitions must be exported when the feature is compiled"
+        );
+        assert!(
+            text.contains("grid_a2a_agent_card_probe_total"),
+            "A2A discovery outcomes must be exported when the feature is compiled"
+        );
+        assert!(
+            text.contains("grid_a2a_agent_card_probe_duration_seconds"),
+            "A2A discovery duration must be exported when the feature is compiled"
         );
     }
 

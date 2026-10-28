@@ -83,6 +83,8 @@ use operator::{
     swim_endpoint::{SwimEndpoint, resolve_endpoint, resolve_endpoint_list_partial},
     swim_runtime::{self, RevisionLease, SwimConfig},
 };
+#[cfg(feature = "a2a")]
+use operator::{controller::agent_to_agent_provider, crd::agent_to_agent_provider::AgentToAgentProvider};
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -346,6 +348,7 @@ async fn main() {
             run_site_controller(writer_client.clone(), writer_ctx.membership()),
             run_provider_controller(writer_client.clone(), writer_site_name),
             run_agent_tool_provider_controller(writer_client.clone()),
+            run_optional_agent_to_agent_provider_controller(writer_client.clone()),
             run_local_scraper(writer_scrape_interval, Arc::clone(&writer_ctx), writer_client.clone()),
             run_model_discovery(writer_ctx, writer_client),
         )
@@ -1953,6 +1956,52 @@ async fn run_agent_tool_provider_controller(client: Client) -> Result<(), Box<dy
         .await;
 
     Ok(())
+}
+
+/// Run the experimental A2A provider controller when the capability is compiled in.
+#[cfg(feature = "a2a")]
+async fn run_optional_agent_to_agent_provider_controller(
+    client: Client,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let api = Api::<AgentToAgentProvider>::all(client.clone());
+    let input_events = agent_to_agent_provider_input_events(&client);
+
+    Controller::new(api, watcher::Config::default())
+        .reconcile_all_on(input_events)
+        .run(
+            agent_to_agent_provider::reconcile,
+            agent_to_agent_provider::error_policy,
+            Arc::new(client),
+        )
+        .for_each(|result| async {
+            match result {
+                Ok((object, _action)) => tracing::debug!(%object, "reconciled AgentToAgentProvider"),
+                Err(error) => log_controller_error("AgentToAgentProvider", &error),
+            }
+        })
+        .await;
+
+    Ok(())
+}
+
+/// Merge site and network changes into bounded-size controller input wiring.
+#[cfg(feature = "a2a")]
+fn agent_to_agent_provider_input_events(client: &Client) -> futures::stream::BoxStream<'static, ()> {
+    let site_api = Api::<GridSite>::all(client.clone());
+    let network_api = Api::<GridNetwork>::all(client.clone());
+    let site_events = watcher(site_api, watcher::Config::default())
+        .filter_map(|event| std::future::ready(event.ok().map(|_event| ())));
+    let network_events = watcher(network_api, watcher::Config::default())
+        .filter_map(|event| std::future::ready(event.ok().map(|_event| ())));
+    futures::stream::select(site_events, network_events).boxed()
+}
+
+/// Keep the default operator free of A2A API discovery and watches.
+#[cfg(not(feature = "a2a"))]
+async fn run_optional_agent_to_agent_provider_controller(
+    _client: Client,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    std::future::pending().await
 }
 
 /// Serve Prometheus metrics and health endpoints.

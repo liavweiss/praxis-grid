@@ -52,6 +52,11 @@ pub(crate) mod test_doubles;
 /// Trust bundle management for grid mTLS.
 pub mod trust_bundle;
 
+/// Bounded A2A Agent Card discovery for `AgentToAgentProvider`.
+#[cfg(feature = "a2a")]
+pub(crate) mod a2a_probe;
+/// Shared no-redirect, DNS-pinned HTTP client for provider discovery.
+pub(crate) mod endpoint_http_client;
 /// SSRF-safe endpoint validation, DNS resolution, and address pinning.
 pub(crate) mod endpoint_resolution;
 /// Shared TLS material resolution and validation for endpoint probes.
