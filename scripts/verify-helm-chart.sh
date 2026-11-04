@@ -1469,6 +1469,12 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
     fi
   done
 
+  if bash scripts/test-gridnetwork-sovereignty.sh "$KCTX"; then
+    pass "kind: GridNetwork sovereignty admission"
+  else
+    fail "kind: GridNetwork sovereignty admission"
+  fi
+
   for short in gnw infpvd; do
     if kubectl --context "$KCTX" get "$short" >/dev/null 2>&1; then
       pass "kind: kubectl get $short"
