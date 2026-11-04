@@ -15,6 +15,10 @@ use crate::crd::inference_provider::Condition;
 /// Gateway model-discovery contract version required for dynamic model routes.
 pub const MODEL_DISCOVERY_CONTRACT_VERSION: &str = "v1";
 
+/// Sovereignty admission rule retained when gateway schema aliases are cloned.
+const SOVEREIGNTY_VALIDATION: &str =
+    "!has(self.sovereignty) || (has(self.siteRouter) && self.siteRouter == 'gridSiteRoute')";
+
 // ---------------------------------------------------------------------------
 // Routing policy
 // ---------------------------------------------------------------------------
@@ -610,14 +614,19 @@ pub fn resolve_budget_statuses(
 
 /// Add deprecated top-level `GridNetwork` field names to the generated schema.
 fn add_grid_network_spec_legacy_fields(schema: &mut schemars::Schema) {
-    crate::crd::add_legacy_field_aliases(schema, &[("gatewayRefs", "consumerGateways")]);
+    crate::crd::add_legacy_field_aliases_preserving(
+        schema,
+        &[("gatewayRefs", "consumerGateways")],
+        &[SOVEREIGNTY_VALIDATION],
+    );
 }
 
 /// Add deprecated gateway-reference field names to the generated schema.
 fn add_gateway_ref_legacy_fields(schema: &mut schemars::Schema) {
-    crate::crd::add_legacy_field_aliases(
+    crate::crd::add_legacy_field_aliases_preserving(
         schema,
         &[("localSiteName", "siteName"), ("consumerConfig", "praxisConfig")],
+        &[SOVEREIGNTY_VALIDATION],
     );
 }
 
@@ -1052,8 +1061,8 @@ pub struct ConsumerConfig {
     pub site_router: SiteRouter,
 
     /// The sovereignty fence `gridSiteRoute` applies: the header naming the zones a request
-    /// may be served in, and whether it refuses or only audits. Under any other router the
-    /// config is not rendered, and the status names `SovereigntyWithoutGridSiteRoute`.
+    /// may be served in, and whether it refuses or only audits. Sovereignty requires
+    /// `siteRouter: gridSiteRoute`; configurations with another router are rejected at admission.
     ///
     /// Default: unset, no fence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2185,6 +2194,57 @@ mod tests {
                     .any(|validation| validation.get("rule").and_then(serde_json::Value::as_str) == Some(rule)),
                 "legacy schema must keep nested validation {rule:?}: {validations:?}"
             );
+        }
+    }
+
+    #[test]
+    fn sovereignty_validation_is_present_on_all_gateway_config_paths() {
+        let crd = crd_json();
+        let rule = "!has(self.sovereignty) || (has(self.siteRouter) && self.siteRouter == 'gridSiteRoute')";
+        for gateways in ["consumerGateways", "gatewayRefs"] {
+            for config in ["praxisConfig", "consumerConfig"] {
+                let path = format!(
+                    "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/{gateways}/items/properties/{config}"
+                );
+                let schema = crd.pointer(&path).unwrap_or_else(|| std::process::abort());
+                let validations = schema
+                    .get("x-kubernetes-validations")
+                    .and_then(serde_json::Value::as_array)
+                    .unwrap_or_else(|| std::process::abort());
+                assert_eq!(
+                    validations
+                        .iter()
+                        .filter(|validation| validation.get("rule").and_then(serde_json::Value::as_str) == Some(rule))
+                        .count(),
+                    1,
+                    "{path} must contain exactly one sovereignty validation"
+                );
+                let sovereignty = schema
+                    .pointer("/properties/sovereignty")
+                    .unwrap_or_else(|| std::process::abort());
+                assert_eq!(
+                    sovereignty.get("nullable"),
+                    Some(&serde_json::json!(true)),
+                    "{path} must allow null sovereignty"
+                );
+                let description = sovereignty
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                assert!(
+                    description.contains("rejected at admission"),
+                    "{path} must describe admission rejection: {description}"
+                );
+                assert!(
+                    !description.contains("SovereigntyWithoutGridSiteRoute"),
+                    "{path} must not describe a status-only error: {description}"
+                );
+                assert_eq!(
+                    schema.pointer("/properties/siteRouter/default"),
+                    Some(&serde_json::json!("intelligentRoute")),
+                    "{path} must retain the router default"
+                );
+            }
         }
     }
 

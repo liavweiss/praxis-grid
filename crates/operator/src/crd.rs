@@ -6,6 +6,15 @@
 /// aliases remain in the structural schema so the API server preserves
 /// legacy resource fields while users migrate to the current names.
 pub(crate) fn add_legacy_field_aliases(schema: &mut schemars::Schema, aliases: &[(&str, &str)]) {
+    add_legacy_field_aliases_preserving(schema, aliases, &[]);
+}
+
+/// Add aliases while retaining selected nested CEL rules in their schemas.
+pub(crate) fn add_legacy_field_aliases_preserving(
+    schema: &mut schemars::Schema,
+    aliases: &[(&str, &str)],
+    retained_rules: &[&str],
+) {
     let validation_rules = {
         let Some(properties) = schema
             .as_object_mut()
@@ -16,7 +25,7 @@ pub(crate) fn add_legacy_field_aliases(schema: &mut schemars::Schema, aliases: &
         };
         aliases
             .iter()
-            .filter_map(|(legacy, current)| add_legacy_field(properties, legacy, current))
+            .filter_map(|(legacy, current)| add_legacy_field(properties, legacy, current, retained_rules))
             .collect()
     };
     append_legacy_validations(schema, validation_rules);
@@ -27,6 +36,7 @@ fn add_legacy_field(
     properties: &mut serde_json::Map<String, serde_json::Value>,
     legacy: &str,
     current: &str,
+    retained_rules: &[&str],
 ) -> Option<serde_json::Value> {
     let mut alias_schema = properties.get_mut(current).map(|field_schema| {
         if let Some(object) = field_schema.as_object_mut() {
@@ -35,7 +45,7 @@ fn add_legacy_field(
         }
         field_schema.clone()
     })?;
-    strip_validation_rules(&mut alias_schema);
+    strip_validation_rules(&mut alias_schema, retained_rules);
     if let Some(alias_object) = alias_schema.as_object_mut() {
         let current_description = alias_object
             .get("description")
@@ -55,18 +65,18 @@ fn add_legacy_field(
     }))
 }
 
-/// Remove nested CEL rules except mutual-exclusion rules from a legacy alias schema.
+/// Remove nested CEL rules except mutual-exclusion and explicitly retained rules.
 ///
 /// The canonical field retains the validation rules. Copying every nested rule
 /// into every legacy alias can exceed Kubernetes' CRD validation-cost budget,
 /// especially when one aliased object contains other aliased objects. The
 /// mutual-exclusion rules must remain so the API server rejects old and new
 /// names together before serde sees duplicate aliases.
-fn strip_validation_rules(value: &mut serde_json::Value) {
+fn strip_validation_rules(value: &mut serde_json::Value, retained_rules: &[&str]) {
     match value {
         serde_json::Value::Array(values) => {
             for entry in values {
-                strip_validation_rules(entry);
+                strip_validation_rules(entry, retained_rules);
             }
         },
         serde_json::Value::Object(object) => {
@@ -74,7 +84,13 @@ fn strip_validation_rules(value: &mut serde_json::Value) {
                 .get_mut("x-kubernetes-validations")
                 .and_then(serde_json::Value::as_array_mut)
             {
-                rules.retain(is_mutual_exclusion_rule);
+                rules.retain(|rule| {
+                    is_mutual_exclusion_rule(rule)
+                        || rule
+                            .get("rule")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|expression| retained_rules.contains(&expression))
+                });
             }
             let remove_empty_rules = object
                 .get("x-kubernetes-validations")
@@ -84,7 +100,7 @@ fn strip_validation_rules(value: &mut serde_json::Value) {
                 object.remove("x-kubernetes-validations");
             }
             for entry in object.values_mut() {
-                strip_validation_rules(entry);
+                strip_validation_rules(entry, retained_rules);
             }
         },
         serde_json::Value::Null
@@ -154,3 +170,28 @@ pub mod site_invite;
 ///
 /// [`InferenceProvider`]: inference_provider::InferenceProvider
 pub mod inference_provider;
+
+#[cfg(test)]
+mod tests {
+    use super::strip_validation_rules;
+
+    #[test]
+    fn legacy_alias_retains_only_selected_and_mutual_exclusion_rules() {
+        let mut schema = serde_json::json!({
+            "properties": {"nested": {"x-kubernetes-validations": [
+                {"rule": "chosen", "message": "preserve"},
+                {"rule": "other", "message": "strip"},
+                {"rule": "!(has(self.old) && has(self.new))", "message": "exclusive"}
+            ]}}
+        });
+        strip_validation_rules(&mut schema, &["chosen"]);
+        assert_eq!(
+            schema.pointer("/properties/nested/x-kubernetes-validations"),
+            Some(&serde_json::json!([
+                {"rule": "chosen", "message": "preserve"},
+                {"rule": "!(has(self.old) && has(self.new))", "message": "exclusive"}
+            ])),
+            "only the selected and mutual-exclusion rules should survive nested alias cloning"
+        );
+    }
+}
